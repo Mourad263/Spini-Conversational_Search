@@ -625,7 +625,7 @@ def _handle_message_inner(
     # cart mutation.
     if (
         cart_action is None and pending is not None and pending.kind == "cart_add_pending"
-        and action.intent == Intent.NO_OP and has_selection_reference
+        and action.intent == Intent.NO_OP and (has_selection_reference or action.generic_reference is not None)
     ):
         cart_action = "add"
 
@@ -640,7 +640,9 @@ def _handle_message_inner(
         # src/scenario/cart_flow.py's handle_cart_action() -- exhaustive
         # over cart_action's 5 literals, always returns a real response. ---
         if cart_action is not None:
-            return handle_cart_action(cart_action, session_id, message, state, activity, action, activity_store, trace)
+            return handle_cart_action(
+                cart_action, session_id, message, state, activity, action, activity_store, trace, pending=pending,
+            )
 
         # --- plain product selection: acknowledges a shown-product
         # reference without opening a checkout draft or touching cart/

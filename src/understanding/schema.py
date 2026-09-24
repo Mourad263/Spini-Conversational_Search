@@ -138,6 +138,16 @@ class Action(BaseModel):
     # among products ALREADY displayed this session, never starts a new brand search --
     # resolution only ever looks at the already-shown list's own name/brand text, never
     # the wider catalog.
+    generic_reference: Literal["singular", "plural"] | None = None  # Generic cart-add
+    # task: the user refers to the shown item(s) ONLY implicitly -- a pronoun, a
+    # demonstrative, or just the bare command with no product stated at all ("it",
+    # "this", "them", "all of them", "add to cart", "حطها في السلة", "ضيفهم للسلة") --
+    # "singular" for one unspecified item, "plural" for the whole currently shown group.
+    # A generic reference is NOT a product description: when this is set, selection_text
+    # must stay null (the command/pronoun is never a product name). Null whenever the
+    # user named a product, gave a position, or said "last". Only a semantic reading of
+    # HOW the user refers to the item; WHICH product(s) that means is decided entirely
+    # from server-side shown/pending state downstream, never from this field.
     checkout_request: bool = False  # Sprint 6 checkout task; cart/direct-checkout
     # architecture task (correction, matches final llm.py SYSTEM_PROMPT semantics):
     # the message asks to FINALIZE a purchase/checkout/pay -- by position

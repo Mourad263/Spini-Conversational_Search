@@ -2,9 +2,9 @@
 moved verbatim out of src/scenario/orchestrator.py -- the purchase-
 authority check every cart/checkout mutation reuses (_unpriced), quantity
 validation, the cart's own API-response snapshot, the combined cart+recent-
-shown NAMED-resolution pool, and the raw-message markers that tell a cart-
-scoped reference ("checkout Pepsi from my cart") and a vague cart-add
-reference ("add it to cart") apart from an ordinary one. These are pure
+shown NAMED-resolution pool, the raw-message marker that tells a cart-scoped
+reference ("checkout Pepsi from my cart") apart from an ordinary one, and the
+structured test for whether a cart add actually named a product at all. These are pure
 functions (or read-only pool builders); the actual cart mutations
 (add_to_cart/remove_from_cart/set_cart_quantity/clear_cart) remain the
 SAME SessionActivityStore methods orchestrator.py already calls -- this
@@ -15,14 +15,21 @@ from __future__ import annotations
 
 import re
 
+from rapidfuzz import fuzz
+
 from src.api.schemas import CartLineOut, CartOut, SessionMessageResponse
 from src.checkout.demo_order import DemoOrderValidationError, validate_quantity
 from src.ingestion.text_normalize import normalize_arabic, normalize_latin
 from src.pricing import effective_price
 from src.response import messages
-from src.scenario.product_selection import _ARABIC_INDIC_DIGITS, _exact_title_matches, _selection_failure_message, _trace_resolve
+from src.scenario.llm_context import resolve_pending_candidates
+from src.scenario.product_selection import (
+    _ARABIC_INDIC_DIGITS, _exact_title_matches, _normalize_field, _selection_failure_message, _trace_resolve,
+)
 from src.scenario.response_builder import _response
-from src.scenario.session_activity import CartLine, DisplayedProduct, SessionActivity, SessionActivityStore
+from src.scenario.session_activity import (
+    CartLine, DisplayedProduct, PendingAction, SessionActivity, SessionActivityStore,
+)
 from src.scenario.trace import RequestTrace
 from src.search_adapter.adapter import FilterSet
 from src.understanding.schema import Action, Intent
@@ -97,26 +104,45 @@ def _to_cart_out(cart: list[CartLine]) -> CartOut:
     return CartOut(lines=lines, total=total)
 
 
-_CART_ADD_VAGUE_SINGULAR_MARKERS_EN = ("it", "this")
-_CART_ADD_VAGUE_SINGULAR_MARKERS_AR = ("ده", "دي")
+_ECHO_SIMILARITY = 85  # a selection_text this close to the WHOLE utterance is the
+# utterance itself, not a description of a product inside it.
 
 
-def _raw_message_has_vague_singular_reference(raw_message: str) -> bool:
-    """cart_action="add"-only conversational fix: "it"/"this"/"this one"/
-    "ده"/"دي" carry NO product name or positional evidence at all, so
-    _resolve_product_selection() already (correctly) returns "not_found"
-    for them -- this only tells the cart_action=="add" branch (its one
-    caller) that the failure was a VAGUE reference rather than an
-    unrelated/unmatched one, so it can ask a deterministic clarification
-    instead of the generic "that wasn't one of the products I showed you"
-    wording. Word-boundary matched so an unrelated word merely containing
-    one of these as a substring ("with", "kit") never false-triggers.
-    Deliberately not reused by checkout/plain selection."""
-    latin = normalize_latin(raw_message)
-    if any(re.search(rf"\b{re.escape(w)}\b", latin) for w in _CART_ADD_VAGUE_SINGULAR_MARKERS_EN):
+def _normalize_generic_add(action: Action, message: str) -> Action:
+    """Deterministic safety net for Action.generic_reference (hardening): the
+    LLM sometimes copies the whole command into selection_text ("add to
+    cart" -> selection_text="add to cart") without marking the reference
+    generic. A selection_text that is effectively the user's ENTIRE
+    utterance carries no product identity -- a product description is a
+    part of the message, never all of it -- so it is dropped and the add is
+    treated as an unresolved generic reference. Purely structural
+    (normalized whole-string similarity): no phrase or language list, so it
+    holds for any wording. Real deterministic evidence is untouched: a
+    stated position/"last" and any exact/named product in the RAW message
+    are still resolved from the message itself by the resolver, so they win
+    regardless of what selection_text held."""
+    text = action.selection_text
+    if not text or action.generic_reference is not None:
+        return action
+    if fuzz.ratio(_normalize_field(text), _normalize_field(message)) < _ECHO_SIMILARITY:
+        return action
+    return action.model_copy(update={"selection_text": None, "generic_reference": "singular"})
+
+
+def _names_a_product(action: Action) -> bool:
+    """Generic cart-add task: True only when the Action carries real product-
+    reference evidence -- a stated position, "last", or a product
+    description. An add with NONE of these ("add to cart", "add it", "حط في
+    السلة", "حطهم في الكارت") is a GENERIC cart action, not an unmatched
+    product name. Decided from the structured Action alone (what the user
+    actually referred to), never from a list of pronouns/commands, so it
+    holds for any wording or language the LLM can read.
+    `generic_reference` overrides selection_text: the LLM declaring the
+    reference generic means any selection_text it copied is the command
+    itself, not a product (see Action.generic_reference)."""
+    if action.selection_ordinals or action.selection_last:
         return True
-    arabic = normalize_arabic(raw_message)
-    return any(re.search(rf"\b{re.escape(w)}\b", arabic) for w in _CART_ADD_VAGUE_SINGULAR_MARKERS_AR)
+    return bool(action.selection_text) and action.generic_reference is None
 
 
 _CART_MARKERS = ("cart", "سلة")  # English "cart"; Arabic "سلة" ("the cart" --
@@ -180,6 +206,7 @@ def _perform_cart_add(
 def handle_cart_action(
     cart_action: str, session_id: str, message: str, state: FilterSet, activity: SessionActivity,
     action: Action, activity_store: SessionActivityStore, trace: RequestTrace,
+    pending: PendingAction | None = None,
 ) -> SessionMessageResponse:
     """C3: cart commands -- resolved deterministically; the LLM only
     signals WHICH operation (`cart_action`) and WHICH item(s)
@@ -218,48 +245,63 @@ def handle_cart_action(
     if cart_action == "add":
         trace.route = "cart_add"
         recent_shown = activity_store.recent_shown_products(session_id)
-        products, reason = _trace_resolve(
-            trace, "last_shown_products+recent_shown", activity.last_shown_products, recent_shown, action, message,
-        )
-        if reason == "not_found" and _raw_message_has_vague_singular_reference(message):
-            # Correction: "it"/"this"/"ده"/"دي" carry no product
-            # evidence at all. A single shown product is trivially the
-            # only possible answer (same exception _resolve_product_
-            # selection() already applies to a vague "last one"); with
-            # 2+ shown products this is a genuine ambiguity, so ask
-            # deterministically instead of the generic/misleading
-            # "not one of the products I showed you" wording.
-            if len(activity.last_shown_products) == 1:
-                products, reason = activity.last_shown_products, "ok"
-            else:
-                # Deterministic conversation-state task: a clarification that
-                # expects a next-turn answer must be backed by durable pending
-                # state, not exist only as text -- see
-                # src/scenario/pending_actions.py's resolve_pending_cart_add()
-                # (the deterministic, 0-LLM continuation this enables) and
-                # src/scenario/llm_context.py (the compact LLM-assisted
-                # continuation for anything that resolver can't settle from
-                # raw evidence alone). State-hardening task (issue 1): the
-                # candidate snapshot is `recent_shown` -- already computed
-                # above, already a proper superset of last_shown_products
-                # (recent_shown_products() always includes the current page
-                # -- see its own docstring) -- frozen here so the next turn
-                # resolves only against THESE ids, never a re-derived pool.
-                activity_store.set_pending_action(
-                    session_id, "cart_add_pending", shown_product_ids=[p.id for p in recent_shown],
+        mid_clarification = pending is not None and pending.kind == "cart_add_pending"
+        if mid_clarification:
+            # Already mid-clarification: the FROZEN candidate snapshot stays
+            # the only authority (same helper the resolver/compact LLM
+            # context use), never a freshly re-derived pool, and any
+            # further clarification re-freezes these SAME ids.
+            candidates = resolve_pending_candidates(activity, activity_store, session_id, pending)
+            current_shown, named_pool, authority = candidates, candidates, "pending_candidates"
+            frozen_ids = list(pending.shown_product_ids)
+        else:
+            current_shown, named_pool = activity.last_shown_products, recent_shown
+            authority = "last_shown_products+recent_shown"
+            frozen_ids = [p.id for p in recent_shown]
+
+        # Generic-reference correction: a bare/pronoun/plural add carries no
+        # product name, so a selection_text the LLM copied from the command
+        # itself must never be resolved as one -- the resolver only ever
+        # sees real reference evidence. (A raw exact/named title in the
+        # message is still found by the resolver directly from the raw text.)
+        action = _normalize_generic_add(action, message)
+        generic = action.generic_reference is not None
+        resolve_action = action.model_copy(update={"selection_text": None}) if generic else action
+        products, reason = _trace_resolve(trace, authority, current_shown, named_pool, resolve_action, message)
+        if reason == "not_found" and not _names_a_product(action):
+            # No product evidence at all: a generic cart-add, so the
+            # deterministic state -- not the wording -- decides what happens.
+            if action.generic_reference == "plural":
+                # The whole current shown group (limited to the frozen
+                # candidates when mid-clarification) -- the SAME multi-
+                # product add path "first and third" already uses.
+                frozen = set(frozen_ids) if mid_clarification else None
+                group = [p for p in activity.last_shown_products if frozen is None or p.id in frozen]
+                if group:
+                    return _perform_cart_add(session_id, message, state, group, action, activity, activity_store, trace)
+            elif len(current_shown) == 1:
+                # A single possible answer needs no clarification.
+                return _perform_cart_add(
+                    session_id, message, state, current_shown, action, activity, activity_store, trace,
                 )
-                return _response(
-                    session_id, None, "cart_add", state, user_message=message,
-                    assistant_message_override=messages.cart_add_vague_reference_response(message),
-                )
+            # 2+ candidates and no way to tell which (or a plural reference
+            # with nothing shown): a genuine ambiguity -- ask, backed by
+            # durable pending state so the very next answer resolves it
+            # deterministically (see src/scenario/pending_actions.py's
+            # resolve_pending_cart_add()).
+            activity_store.set_pending_action(session_id, "cart_add_pending", shown_product_ids=frozen_ids)
+            return _response(
+                session_id, None, "cart_add", state, user_message=message,
+                assistant_message_override=messages.cart_add_vague_reference_response(message),
+            )
         if reason != "ok":
             activity_store.set_pending_action(  # see note above
-                session_id, "cart_add_pending", shown_product_ids=[p.id for p in recent_shown],
+                session_id, "cart_add_pending", shown_product_ids=frozen_ids,
             )
             return _response(
                 session_id, None, "cart_add", state, user_message=message,
                 assistant_message_override=_selection_failure_message(
-                    message, reason, len(activity.last_shown_products),
+                    message, reason, len(current_shown),
                 ),
             )
         return _perform_cart_add(session_id, message, state, products, action, activity, activity_store, trace)

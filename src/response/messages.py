@@ -362,10 +362,9 @@ def cart_selection_not_found_response(user_message: str) -> str:
 
 
 def cart_add_vague_reference_response(user_message: str) -> str:
-    """A cart_action="add" turn whose only "evidence" is a vague singular
-    reference ("it"/"this"/"ده"/"دي") with 2+ shown products currently on
-    screen -- see src/scenario/orchestrator.py's
-    _raw_message_has_vague_singular_reference()."""
+    """A cart_action="add" turn that names no product and gives no position
+    (a pronoun or bare command) with 2+ candidate products on screen -- see
+    src/scenario/cart_flow.py's handle_cart_action() and _names_a_product()."""
     if is_arabic_dominant(user_message):
         return "تحب تضيف أنهي منتج للسلة؟ قولّي الاسم أو الرقم."
     return "Which product would you like to add to your cart? You can tell me the product name or number."

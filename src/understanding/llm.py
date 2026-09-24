@@ -220,7 +220,15 @@ selection_ordinals when the raw wording explicitly states both together
 ("first, third and last" -> selection_ordinals=[1, 3], selection_last=true).
 selection_text = brief identifying description/brand of a shown/cart item --
 mutually EXCLUSIVE with selection_ordinals/selection_last: set it only when
-NEITHER a position nor "last" was stated.
+NEITHER a position nor "last" was stated. It holds ONLY words that describe the
+product itself; it is never the cart/checkout command, a pronoun, or the cart.
+generic_reference = how the item is referred to when NO product is named and no
+position is stated: "singular" for an unspecified single item ("it", "this",
+"add to cart", "ضيفه", "حطها في السلة"), "plural" for the whole currently shown
+group ("them", "these", "all of them", "حطهم في الكارت"). With a generic
+reference selection_text, selection_ordinals and selection_last stay empty --
+the pronoun or the bare command is not a product description. Null when a
+product was named, a position was given, or "last" was said.
 Never invent a real product ID.
 
 checkout_request:
@@ -245,7 +253,9 @@ Set only when the message is about the CART itself, not a normal search/selectio
 checkout.
 add = asks to save a shown/named item for later purchase ("add this to cart", "add
 Pepsi and Sardine to cart", "ضيف ده للسلة", "ضيف البيبسي والسردين للسلة") -- never
-checkout_request by itself (adding is not finalizing).
+checkout_request by itself (adding is not finalizing). When the item is only
+implied ("add to cart", "add them", "حط في السلة"), still cart_action="add" with
+generic_reference set and no selection_* fields.
 view = asks what is in the cart ("show my cart", "what's in my cart", "وريني
 السلة", "ايه اللي في السلة").
 remove = asks to take an item out of the cart ("remove Pepsi", "remove the second
