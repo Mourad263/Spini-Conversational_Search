@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fastapi import FastAPI, HTTPException, Query, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 from decimal import Decimal  # noqa: E402
 
 from src.api.schemas import (  # noqa: E402
@@ -169,3 +170,40 @@ def checkout_submit(session_id: str, body: CheckoutSubmitRequest) -> CheckoutSub
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Production: serve the built React frontend (frontend/dist) from this same
+# app so the demo is ONE origin. Registered LAST, after every API route
+# (including /health), so it can never shadow them: FastAPI matches routes in
+# registration order, and the catch-all below only sees paths no API route
+# claimed. Absent in local dev (no build) -- the API is unaffected.
+# ---------------------------------------------------------------------------
+
+_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+_FRONTEND_INDEX = _FRONTEND_DIST / "index.html"
+
+if (_FRONTEND_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="frontend-assets")
+
+
+def _frontend_index() -> FileResponse:
+    if not _FRONTEND_INDEX.is_file():
+        raise HTTPException(status_code=503, detail="Frontend build not found.")
+    return FileResponse(_FRONTEND_INDEX)
+
+
+@app.get("/", include_in_schema=False)
+def frontend_root() -> FileResponse:
+    return _frontend_index()
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def frontend_spa_fallback(full_path: str) -> FileResponse:
+    # Only GET reaches here (API POST routes are unaffected). A real file in
+    # the build (favicon, etc.) is served as-is; anything else is a client-
+    # side route and gets index.html. Paths escaping dist are never served.
+    candidate = (_FRONTEND_DIST / full_path).resolve()
+    if candidate.is_file() and _FRONTEND_DIST.resolve() in candidate.parents:
+        return FileResponse(candidate)
+    return _frontend_index()

@@ -1,4 +1,9 @@
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+// Local dev talks to the FastAPI dev server; a production build is served by
+// that same FastAPI app, so it defaults to SAME ORIGIN. VITE_API_BASE_URL
+// still overrides either default.
+const BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.PROD ? "" : "http://127.0.0.1:8000");
 
 // POST /session/{session_id}/message -- the one and only conversational
 // endpoint (src/api/routes.py). One user Send = exactly one call here;
