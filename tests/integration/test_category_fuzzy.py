@@ -574,9 +574,18 @@ def test_real_case_dish_no_longer_restricted_to_modish_brand_via_http_endpoint()
     # Rose to 117 once the tokenizer's "-es" ambiguity was ALSO fixed
     # (research.md) -- "dish" and "dishes" now both stem to "dish" (not
     # the old "dishe" for the plural), so BM25 finds the full combined set.
+    # Dropped to 77 (Sprint 6 search+recommendation context task):
+    # vector_rank's fusion contribution is now gated by the SAME
+    # VECTOR_FALLBACK_MAX_DISTANCE floor as the vector-only fallback --
+    # the 40 removed rows (pasta, sandwiches, cheese spreads, salad
+    # dressing, smoked turkey breast) were never genuinely "dish"-related,
+    # just semantically-nearby noise fusion previously added unfiltered.
+    # 77 is exactly BM25's own literal "dish"/"dishes" count -- both
+    # original protections (no brand hijack, no plural-tokenizer split)
+    # remain intact; only the never-audited vector-fusion noise is gone.
     r = client.get("/search/keyword", params={"q": "dish"})
     assert r.status_code == 200
     data = r.json()
     assert data["resolved_brand"] is None
-    assert data["total_count"] == 117
+    assert data["total_count"] == 77
     assert not all(p["brand_normalized"] == "modish" for p in data["products"])

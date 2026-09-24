@@ -75,10 +75,24 @@ def test_add_and_modify_filter_overwrite_one_field_leaving_others_untouched(
     result = mgr.apply(SESSION, Action(intent=intent), resolved)
 
     assert getattr(result, field) == second_value
+
+    # price_min/price_max are NOT independent of each other under
+    # MODIFY_FILTER the way category/brand are: the baseline here only has
+    # price_max active, so a MODIFY_FILTER that states price_min alone is a
+    # one-sided direction flip (see StateManager.apply's price-facet rule
+    # and tests/state_manager's dedicated direction-flip tests) and
+    # intentionally drops the stale price_max, rather than leaving it
+    # untouched like a genuinely independent field.
+    price_direction_flip = intent == Intent.MODIFY_FILTER and field == "price_min"
+
     for other_field in ("category", "brand", "price_min", "price_max"):
-        if other_field != field:
-            baseline = FilterSet(category="milk_29", brand="juhayna", price_max=200)
-            assert getattr(result, other_field) == getattr(baseline, other_field)
+        if other_field == field:
+            continue
+        if price_direction_flip and other_field == "price_max":
+            assert result.price_max is None
+            continue
+        baseline = FilterSet(category="milk_29", brand="juhayna", price_max=200)
+        assert getattr(result, other_field) == getattr(baseline, other_field)
 
 
 def test_add_filter_on_an_empty_session_just_sets_the_field():
@@ -122,6 +136,158 @@ def test_modify_filter_non_conflicting_single_bound_preserves_the_other_bound():
 
     assert result.price_min == 20  # unaffected -- 20 <= 100, no conflict
     assert result.price_max == 100
+
+
+def test_modify_filter_opposite_bound_landing_exactly_on_retained_bound_clears_it():
+    # Live regression: "deodorant under 200" then bare "above 200" -- the
+    # retained price_max (200) is not numerically GREATER than the new
+    # price_min (200), so a strict `>` contradiction check let it survive,
+    # producing an impossible price_min=200/price_max=200 range that
+    # matches zero real products.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(category="deodorant_1", price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_min=200.0))
+
+    assert result.price_min == 200.0
+    assert result.price_max is None
+    assert result.category == "deodorant_1"  # active product/category context preserved
+
+
+def test_modify_filter_flips_from_upper_bound_to_lower_bound():
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=300.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_max=120.0))
+
+    assert result.price_min is None
+    assert result.price_max == 120.0
+
+
+def test_modify_filter_same_direction_price_change_has_no_stale_opposite_bound():
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_max=90.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_max=60.0))
+
+    assert result.price_min is None
+    assert result.price_max == 60.0
+
+
+def test_modify_filter_same_direction_min_change_has_no_stale_opposite_bound():
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=40.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_min=75.0))
+
+    assert result.price_min == 75.0
+    assert result.price_max is None
+
+
+def test_modify_filter_two_sided_range_stays_intact():
+    mgr = StateManager()
+    result = mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=100.0, price_max=200.0))
+
+    assert result.price_min == 100.0
+    assert result.price_max == 200.0
+
+
+def test_modify_filter_from_active_range_to_upper_bound_drops_old_max():
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=100.0, price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_min=300.0))
+
+    assert result.price_min == 300.0
+    assert result.price_max is None
+
+
+def test_modify_filter_from_active_range_to_lower_bound_drops_old_min():
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=100.0, price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_max=80.0))
+
+    assert result.price_min is None
+    assert result.price_max == 80.0
+
+
+# --- direction-changing MODIFY_FILTER on a one-sided facet: intent + shape
+# decide the outcome, not whether the new number happens to numerically
+# clash with the old one (follow-up generalization). ---
+
+def test_modify_filter_direction_flip_with_non_contradicting_number_replaces_facet():
+    # "deodorant under 200" -> "above 150": 150 does NOT numerically
+    # contradict the retained 200 (150 < 200), so a contradiction-only rule
+    # would wrongly keep both and produce 150-200. MODIFY_FILTER changing
+    # direction on a one-sided facet must still replace it outright.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(category="deodorant_1", price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_min=150.0))
+
+    assert result.price_min == 150.0
+    assert result.price_max is None
+    assert result.category == "deodorant_1"
+
+
+def test_modify_filter_direction_flip_with_contradicting_number_still_replaces_facet():
+    # "under 200" -> "above 250": here 250 DOES numerically contradict 200
+    # too, so this must keep passing under the more general shape-based rule.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_min=250.0))
+
+    assert result.price_min == 250.0
+    assert result.price_max is None
+
+
+def test_modify_filter_direction_flip_upper_to_lower_with_non_contradicting_number():
+    # "above 200" -> "under 300": 300 does not contradict 200 either.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_max=300.0))
+
+    assert result.price_min is None
+    assert result.price_max == 300.0
+
+
+def test_modify_filter_direction_flip_upper_to_lower_with_contradicting_number():
+    # "above 200" -> "under 100": still correct under the general rule.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_max=100.0))
+
+    assert result.price_min is None
+    assert result.price_max == 100.0
+
+
+def test_modify_filter_explicit_range_compatible_max_change_keeps_min():
+    # "100-200" -> modify max to 250: an explicit two-sided range already
+    # existed, and 100 is still compatible with the new max, so the
+    # untouched side (min=100) is preserved rather than dropped.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=100.0, price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_max=250.0))
+
+    assert result.price_min == 100.0
+    assert result.price_max == 250.0
+
+
+def test_modify_filter_explicit_range_compatible_min_change_keeps_max():
+    # "100-200" -> modify min to 150: 150 is still compatible with the
+    # existing max, so the untouched side (max=200) is preserved.
+    mgr = StateManager()
+    mgr.apply(SESSION, Action(intent=Intent.SEARCH), FilterSet(price_min=100.0, price_max=200.0))
+
+    result = mgr.apply(SESSION, Action(intent=Intent.MODIFY_FILTER), FilterSet(price_min=150.0))
+
+    assert result.price_min == 150.0
+    assert result.price_max == 200.0
 
 
 def test_add_filter_with_the_same_conflicting_input_is_unchanged_out_of_scope():

@@ -12,14 +12,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from fastapi import FastAPI, Query, Request  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from decimal import Decimal  # noqa: E402
 
 from src.api.schemas import (  # noqa: E402
-    KeywordSearchResponse, ProductOut, SessionMessageRequest, SessionMessageResponse,
+    CartDeltaRequest, CartMutationResponse, CheckoutOrderLineOut, CheckoutOrderOut, CheckoutSubmitRequest,
+    CheckoutSubmitResponse, KeywordSearchResponse, ProductOut, SessionMessageRequest, SessionMessageResponse,
 )
+from src.scenario.cart_mutation import CartMutationError, apply_cart_delta  # noqa: E402
+from src.scenario.checkout_submission import CheckoutSubmissionError, submit_checkout  # noqa: E402
 from src.scenario.orchestrator import get_activity_store, get_state_manager, handle_message  # noqa: E402
 from src.search_adapter.adapter import InvalidFilterError, SearchAdapter  # noqa: E402
 from src.search_engine.keyword_baseline import parse_keyword_query  # noqa: E402
@@ -108,6 +111,58 @@ def session_message(session_id: str, body: SessionMessageRequest) -> SessionMess
         session_id, body.message,
         state_manager=get_state_manager(),
         activity_store=get_activity_store(),
+    )
+
+
+@app.post("/session/{session_id}/cart/item", response_model=CartMutationResponse)
+def cart_item_delta(session_id: str, body: CartDeltaRequest) -> CartMutationResponse:
+    # Final UI task: deterministic, 0-LLM cart mutation for UI buttons (the
+    # product-card stepper, the cart drawer's +/-) -- the frontend already
+    # knows product_id; this never calls handle_message()/understand(), so
+    # it can never make a Groq call or fuzzy-resolve a product. Product
+    # data is always re-resolved against real catalog data here, never
+    # trusted from React (src/scenario/cart_mutation.py).
+    try:
+        result = apply_cart_delta(
+            session_id, body.product_id, body.delta,
+            activity_store=get_activity_store(),
+        )
+    except CartMutationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return CartMutationResponse(**result)
+
+
+@app.post("/session/{session_id}/checkout/submit", response_model=CheckoutSubmitResponse)
+def checkout_submit(session_id: str, body: CheckoutSubmitRequest) -> CheckoutSubmitResponse:
+    # Sprint 6 checkout-submission task: deliberately NOT part of
+    # handle_message()'s natural-language turn pipeline -- a structured
+    # form POST, zero LLM/search/recommendation/embedding calls. Product
+    # identity/price/payment_method are never taken from this request body
+    # (see src/scenario/checkout_submission.py's submit_checkout()).
+    try:
+        result = submit_checkout(
+            session_id,
+            lines=[(line.product_id, line.quantity) for line in body.lines],
+            customer_name=body.customer_name,
+            phone=body.phone,
+            delivery_address=body.delivery_address,
+            state_manager=get_state_manager(),
+            activity_store=get_activity_store(),
+        )
+    except CheckoutSubmissionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    order = result["order"]
+    return CheckoutSubmitResponse(
+        order=CheckoutOrderOut(
+            order_id=order["order_id"],
+            lines=[CheckoutOrderLineOut(**line) for line in order["lines"]],
+            total_price=order["total_price"],
+            payment_method=order["payment_method"],
+            status=order["status"],
+        ),
+        assistant_message=result["assistant_message"],
+        cart=result["cart"],
     )
 
 

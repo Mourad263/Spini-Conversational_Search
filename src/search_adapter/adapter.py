@@ -12,15 +12,29 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.pricing import effective_price  # noqa: E402
 from src.search_engine.index import get_index  # noqa: E402
 from src.search_engine.query import hard_filter  # noqa: E402
-from src.search_engine.ranking import correct_unmatched_terms, rank  # noqa: E402
+from src.search_engine.ranking import corpus_cooccurrence_ids, correct_unmatched_terms, rank  # noqa: E402
 from src.search_engine.vector_search import (  # noqa: E402
     VECTOR_FALLBACK_MAX_DISTANCE,
     VECTOR_TOP_N,
     reciprocal_rank_fusion,
     vector_rank,
 )
+
+
+def _price_sort_key(row: dict) -> tuple[bool, float]:
+    """Sorts ascending by EFFECTIVE price (src/pricing.py's
+    effective_price() -- the SAME rule price filtering (query.py's own
+    effective_price CASE expression)/display/checkout already use), never
+    raw `price` alone -- a discounted row must sort by what it actually
+    costs, not its pre-discount price. An unknown price (neither field a
+    real positive number, e.g. price=special_price=0) always sorts AFTER
+    every known price -- never mistaken for the cheapest via a bare
+    price=0."""
+    price = effective_price(row["price"], row["special_price"])
+    return (True, 0.0) if price is None else (False, price)
 
 
 class InvalidFilterError(ValueError):
@@ -124,6 +138,33 @@ class SearchAdapter:
                 # was always the brand's full catalog count instead of
                 # the 9 genuine matches. Trust BM25 alone in that regime.
                 ranked = bm25_ranked
+            elif bm25_ids and len((filters.query_text or "").split()) >= 2 and \
+                    corpus_cooccurrence_ids(index, (filters.query_text or "").split()):
+                # Sprint 6 product-identity relevance task: a MULTI-word
+                # query where a real product's own tokenization already
+                # contains every word together (the same shared corpus-
+                # evidence primitive the out-of-catalog gate uses, via
+                # keyword_baseline.py's _corpus_cooccurrence_ids) -- the
+                # query is itself a directly-attested catalog concept,
+                # not a paraphrase needing semantic recovery (unlike
+                # "cookies milq", where no real product combines
+                # "cookies" with "milq" at all -- that case still falls
+                # through to the fusion branch below). Deliberately NOT
+                # applied to single-word queries too (a tempting
+                # generalization that regressed two existing, confirmed
+                # single-word fixes -- "cookie" and "dish" -- which rely
+                # on vector fusion adding genuinely relevant items with
+                # no literal token overlap at all; single-word ranking is
+                # instead corrected directly in ranking.py/index.py
+                # below). Fusing on an already-complete, directly-
+                # attested multi-word concept only interleaves
+                # semantically-nearby-but-wrong neighbours by RRF
+                # position ahead of the strongest literal matches on
+                # THIS query's own lexical evidence. "watermelon juice"
+                # (no real product combines both words) deliberately
+                # still reaches fusion below -- vector genuinely bridges
+                # "juice" to real Drink products.
+                ranked = bm25_ranked
             elif bm25_ids:
                 # BM25 found real matches AND the candidate pool is large
                 # enough (> VECTOR_TOP_N) that vector_rank's LIMIT is a
@@ -135,13 +176,24 @@ class SearchAdapter:
                 # Milk Chocolate", "Mcvitie's ... Milk Chocolate Biscuit")
                 # that BM25's "cookies" match alone could never surface.
                 # Fusing here adds real recall without reintroducing the
-                # flooding case above. No distance gate on this path: BM25
-                # already supplies literal-match evidence that the query
-                # means something, so vector only ever adds recall on top.
+                # flooding case above. BM25 having its OWN literal-match
+                # evidence does not make every one of vector's top-100
+                # additions trustworthy too, though -- real symptom: for
+                # "turkey" (67 real literal matches), un-gated fusion
+                # ranked "Turkish Coffee Maker" appliances into the
+                # result purely by embedding proximity (0.357+ cosine
+                # distance -- already past VECTOR_FALLBACK_MAX_DISTANCE).
+                # The SAME already-calibrated per-result floor as the
+                # vector-only fallback below keeps genuine fusion recall
+                # (confirmed: "cookies milq"'s real milk-related additions
+                # run 0.21-0.26, comfortably inside it) while dropping
+                # tail noise no literal or semantic evidence supports.
                 # Reciprocal Rank Fusion combines ranked lists by POSITION,
                 # not raw score -- BM25 scores and cosine similarities live
                 # on different, incomparable scales.
-                vector_ids = vector_rank(candidate_ids, filters.query_text)
+                vector_ids = vector_rank(
+                    candidate_ids, filters.query_text, per_result_max_distance=VECTOR_FALLBACK_MAX_DISTANCE,
+                )
                 ranked = reciprocal_rank_fusion([bm25_ids, vector_ids])
             else:
                 # BM25 found NOTHING even after the correction pass above
@@ -165,13 +217,12 @@ class SearchAdapter:
         else:
             # No text query: no BM25 score, no vector query to run either
             # (there is no query to embed). Filter-only candidates have no
-            # relevance signal to rank by -- default to price ascending
-            # (nulls last) as the least-surprising order. Found live: this
-            # used to return Python set-iteration order, which looked like
-            # nothing (not price, not name).
+            # relevance signal to rank by -- default to effective price
+            # ascending (unknown prices last) as the least-surprising
+            # order. Found live: this used to return Python set-iteration
+            # order, which looked like nothing (not price, not name).
             ranked = [(pid, 0.0) for pid in candidate_ids]
-            ranked.sort(key=lambda pair: (by_id[pair[0]]["price"] is None,
-                                           by_id[pair[0]]["price"] or 0))
+            ranked.sort(key=lambda pair: _price_sort_key(by_id[pair[0]]))
 
         page = ranked[offset:offset + limit]
         products = [by_id[pid] for pid, _score in page]

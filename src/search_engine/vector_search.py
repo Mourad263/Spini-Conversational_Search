@@ -55,7 +55,7 @@ VECTOR_FALLBACK_MAX_DISTANCE = 0.31
 
 def vector_rank(
     candidate_ids: set[int], query_text: str, top_n: int = VECTOR_TOP_N,
-    max_distance: float | None = None,
+    max_distance: float | None = None, per_result_max_distance: float | None = None,
 ) -> list[int]:
     """Embed `query_text` and return up to `top_n` candidate product ids
     ordered by ascending cosine distance (nearest first). Restricted to
@@ -71,8 +71,20 @@ def vector_rank(
     query's own results span well past any usable cutoff (real example:
     "milq" runs 0.2976 to 0.34+ across its 40 real milk results), so
     per-result filtering would gut a query the gate has already judged
-    trustworthy. Left None by callers that fuse with BM25, which has its
-    own literal-match evidence and doesn't need this."""
+    trustworthy. Left None by callers that fuse with BM25 for a query
+    where every word already has its own literal corpus presence.
+
+    `per_result_max_distance` is the OPPOSITE shape -- a per-row cutoff
+    (this one) for the fusion path specifically, confirmed necessary live:
+    for "turkey" (real BM25 matches on their own, so `max_distance` is
+    never applied), vector_rank's un-gated top-100 pulled in "Turkish
+    Coffee Maker" appliances purely by embedding proximity (0.357+,
+    already past VECTOR_FALLBACK_MAX_DISTANCE=0.31) -- BM25 having ITS
+    OWN evidence does not make every one of vector's top-100 additions
+    trustworthy too. Genuine fusion rescues stay comfortably inside 0.31
+    (confirmed: "cookies milq"'s real milk-related additions run
+    0.21-0.26), so this never costs real recall, only unrelated tail
+    noise."""
     if not candidate_ids:
         return []
 
@@ -96,6 +108,8 @@ def vector_rank(
         return []
     if max_distance is not None and rows[0][1] > max_distance:
         return []
+    if per_result_max_distance is not None:
+        rows = [row for row in rows if row[1] <= per_result_max_distance]
     return [row[0] for row in rows]
 
 

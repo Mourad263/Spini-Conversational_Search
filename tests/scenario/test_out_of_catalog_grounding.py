@@ -6,6 +6,7 @@ REAL SearchAdapter/DB so tests can assert it was never even called for a
 rejected request.
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from src.search_adapter.adapter import FilterSet, SearchAdapter, SearchResult  #
 from src.state_manager.state_manager import StateManager  # noqa: E402
 from src.understanding.schema import Action, Intent  # noqa: E402
 
+LOGGER_NAME = "src.scenario.orchestrator"
+
 
 def stub_understand(*actions: Action):
     it = iter(actions)
@@ -25,6 +28,12 @@ def stub_understand(*actions: Action):
         return next(it)
 
     return _stub
+
+
+def _last_trace(caplog) -> dict:
+    records = [r for r in caplog.records if r.name == LOGGER_NAME and r.msg == "request_trace %s"]
+    assert records, "expected a request_trace log record"
+    return records[-1].args
 
 
 class RecordingSearch:
@@ -57,6 +66,15 @@ def test_gate_passes_with_no_query_text():
 
 def test_gate_passes_real_multiword_query_all_tokens_attested():
     assert _lacks_catalog_evidence(FilterSet(query_text="oat milk")) is False
+
+
+def test_gate_rejects_words_independently_present_but_never_co_occurring():
+    # Sprint 6 fuzzy-category-grounding follow-up: "laptop" and "charger"
+    # each independently occur in a few unrelated real products, but ZERO
+    # real products contain both words together -- independent presence
+    # alone (the OLD rule) wrongly let this through; genuine co-occurrence
+    # (the NEW rule) correctly rejects it.
+    assert _lacks_catalog_evidence(FilterSet(query_text="laptop charger")) is True
 
 
 # --- A: the known regression, through the full orchestrator path ---
@@ -186,6 +204,114 @@ def test_recommendation_behavior_unaffected_for_valid_search():
     # real recommendation service ran (real DB/clustering) -- non-empty for a
     # real, populous category like milk
     assert isinstance(r.recommendations, list)
+
+
+# --- H: natural container/partitive phrasing ("a bag of chips") must not be
+# mistaken for an out-of-catalog concept -- the LLM is expected to extract
+# the product itself (raw_query_text="chips"), not the container phrase, so
+# these stub Actions reflect that FIXED understanding-layer output. The
+# live regression is verified separately in the task report. ---
+
+def test_bag_of_chips_container_phrase_not_out_of_catalog(caplog):
+    # Full end-to-end scenario regression (Sprint 6 product-identity
+    # cleanup task): given the understanding layer's own fixed, already-
+    # verified output for this exact message (raw_query_text="chips", the
+    # container word stripped -- see this module's docstring for where
+    # the live LLM behavior itself was verified), the turn must reach the
+    # normal shopping_search route with a real search call, never the
+    # out-of-catalog gate.
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="chips", category_hint="chips"))
+    search = RecordingSearch()
+
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        r = handle_message("s1", "i want a bag of chips", state_manager=sm, activity_store=store,
+                            understand_fn=understand_fn, search_fn=search)
+
+    assert len(search.calls) == 1
+    assert r.likely_out_of_catalog is False
+    trace = _last_trace(caplog)
+    assert trace["route"] == "shopping_search"
+    assert trace["search_calls"] == 1
+
+
+def test_bag_of_chips_with_price_full_path():
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(
+        Action(intent=Intent.SEARCH, raw_query_text="chips", category_hint="chips", price_max=50.0),
+    )
+    search = RecordingSearch()
+
+    r = handle_message("s1", "i want a bag of chips under 50", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=search)
+
+    assert len(search.calls) == 1
+    assert r.likely_out_of_catalog is False
+    assert search.calls[0].price_max == 50.0
+
+
+def test_potato_chips_multiword_concept_preserved():
+    # regression guard: fixing the container-phrase case must not turn a
+    # genuine multi-word product concept into just its final noun.
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="potato chips", price_max=50.0))
+    search = RecordingSearch()
+
+    r = handle_message("s1", "potato chips under 50", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=search)
+
+    assert len(search.calls) == 1
+    assert r.likely_out_of_catalog is False
+
+
+def test_multivitamin_tablets_correctly_rejected_no_catalog_evidence():
+    # Sprint 6 multivitamin investigation: authoritative catalog check
+    # (real DB scan) found ZERO products under "multivitamin" in any
+    # spelling, ZERO dietary-supplement tablets (the only "tablet(s)"
+    # matches are dishwasher/laundry/sweetener/charcoal tablets), and no
+    # pharmacy/supplement/vitamin canonical category at all -- every real
+    # "vitamin" match is a cosmetic/food product listing it as an
+    # ingredient (shampoo, face cream, hair oil, cocoa powder). This
+    # catalog genuinely does not sell vitamin supplements, under any
+    # wording -- out-of-catalog is the CORRECT result, not a grounding
+    # bug. raw_query_text reflects the understanding layer's own
+    # container-word-stripping/typo-normalization rules (see this
+    # module's docstring for how that's verified) -- "tablets" is real
+    # product-FORM identity here (kept, like "potato chips" keeps
+    # "potato"), not a stripped container word.
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="multivitamin tablets"))
+    search = RecordingSearch()
+
+    r = handle_message("s1", "i want a multivitamen tablets", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=search)
+
+    assert len(search.calls) == 0
+    assert r.likely_out_of_catalog is True
+
+
+def test_laptop_charger_full_path_still_rejected():
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="laptop charger"))
+    search = RecordingSearch()
+
+    r = handle_message("s1", "laptop charger", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=search)
+
+    assert len(search.calls) == 0
+    assert r.likely_out_of_catalog is True
+
+
+def test_car_tires_full_path_still_rejected():
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="car tires"))
+    search = RecordingSearch()
+
+    r = handle_message("s1", "car tires", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=search)
+
+    assert len(search.calls) == 0
+    assert r.likely_out_of_catalog is True
 
 
 # --- state safety: a rejected ADD_FILTER never overwrites the active search ---

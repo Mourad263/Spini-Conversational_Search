@@ -157,3 +157,83 @@ def test_non_expired_session_still_recalls_prior_turns():
 
     assert "I need milk" in r.assistant_message
     assert sm.get_state("s1").category == "milk_29"  # shopping state also survived
+
+
+# ======================================================================
+# Abandoned-session reclaim: get()'s own lazy expiry only ever revisits
+# the SAME session_id being accessed -- an id that's simply never
+# accessed again (a "New Chat" moving on to a fresh session_id) never
+# gets cleaned up on its own. reclaim_abandoned() fixes that, amortized
+# (SessionActivityStore._RECLAIM_CHECK_EVERY) rather than scanning on
+# every request -- these tests drive the internal access counter directly
+# to the amortization's trigger point (call #1) rather than looping
+# _RECLAIM_CHECK_EVERY times, the same "reach into internal state"
+# convention already used elsewhere in this suite for deterministic setup.
+# ======================================================================
+
+# --- G: an abandoned, expired session is reclaimed by a DIFFERENT
+# session's access -- its own id is never revisited ---
+
+def test_abandoned_expired_session_reclaimed_via_different_session_access():
+    store = SessionActivityStore()
+    store.get("old-session", now=0.0)  # abandoned -- never touched again
+
+    store._access_count = 1  # force the amortized trigger point deterministically
+    reclaimed = store.reclaim_abandoned(PAST_TTL, exclude="new-session")
+
+    assert reclaimed == ["old-session"]
+    assert "old-session" not in store._sessions
+
+
+# --- H: its StateManager state is removed too (full orchestrator wiring) ---
+
+def test_abandoned_session_state_manager_entry_also_removed():
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(
+        Action(intent=Intent.SEARCH, raw_query_text="milk", category_hint="milk"),
+        Action(intent=Intent.SEARCH, raw_query_text="pepsi", brand_text="pepsi"),
+    )
+    search = RecordingSearch()
+    handle_message("old-session", "I need milk", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=search, now=0.0)
+    assert sm.get_state("old-session").category == "milk_29"
+
+    store._access_count = 0  # so the NEXT get() (inside handle_message below) lands on
+    # access #1 -- the amortized reclaim trigger -- deterministically, not by chance
+    handle_message("new-session", "I need pepsi", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=search, now=PAST_TTL)
+
+    assert "old-session" not in store._sessions
+    assert sm.get_state("old-session") == FilterSet()  # StateManager's half reclaimed too
+
+
+# --- I: a non-expired session survives the same reclaim sweep ---
+
+def test_non_expired_session_survives_reclaim_sweep():
+    store = SessionActivityStore()
+    store.get("recent-session", now=0.0)
+
+    store._access_count = 1
+    reclaimed = store.reclaim_abandoned(SESSION_TTL_SECONDS - 100.0, exclude="new-session")
+
+    assert reclaimed == []
+    assert "recent-session" in store._sessions
+
+
+# --- J: the CURRENT active session is never reclaimed, even if its own
+# timestamp would otherwise look expired by the time of the sweep ---
+
+def test_current_session_never_reclaims_itself():
+    store = SessionActivityStore()
+    store.get("s1", now=0.0)
+
+    store._access_count = 1
+    reclaimed = store.reclaim_abandoned(PAST_TTL, exclude="s1")
+
+    assert reclaimed == []
+    assert "s1" in store._sessions
+
+
+# --- K: normal per-id expiry-on-access behavior (existing tests C/D
+# above) is unaffected by the reclaim addition -- confirmed by those
+# tests still passing unchanged in this same file.

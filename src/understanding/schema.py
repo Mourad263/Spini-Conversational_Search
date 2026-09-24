@@ -114,6 +114,64 @@ class Action(BaseModel):
     # src/state_manager/state_manager.py already store -- no new search, no
     # RecommendationService, no second LLM call (see src/response/messages.py's
     # memory_recall_answer() and src/scenario/orchestrator.py's handle_message()).
+    selection_ordinals: list[int] | None = None  # Sprint 6 product-selection task,
+    # generalized (cart/direct-checkout architecture task correction) from a single
+    # selection_ordinal to a LIST: one or more 1-based positions ("first"=[1],
+    # "third"=[3], "first and third"=[1, 3], "number 5"=[5]) when the user refers to
+    # PREVIOUSLY SHOWN/cart product(s) by position, never a new search. Which real
+    # product(s) those actually are gets resolved deterministically downstream against
+    # src/scenario/session_activity.py's last_shown_products or the cart -- this field
+    # only signals the position(s); it never carries or invents a product id. Every
+    # stated position must be an EXPLICIT number/ordinal word -- never a range, never
+    # "the rest".
+    selection_last: bool = False  # same idea as selection_ordinals, for "last one"/"آخر
+    # واحد"/"الاخير" instead of an explicit number. MAY coexist with selection_ordinals
+    # (correction) when the raw wording explicitly states both together -- "first and
+    # last" -> selection_ordinals=[1], selection_last=true; "first, third and last" ->
+    # selection_ordinals=[1, 3], selection_last=true -- the resolver combines them into
+    # one all-or-nothing set rather than one silently overriding/dropping the other.
+    # Mutually EXCLUSIVE with selection_text: set selection_text only when NEITHER a
+    # position nor "last" was stated.
+    selection_text: str | None = None  # a brief description/brand of a PREVIOUSLY SHOWN
+    # product ("the Juhayna one", "the lactose-free one", "جهينة") when the user refers
+    # to it by description rather than position. Differs from brand_text: this picks
+    # among products ALREADY displayed this session, never starts a new brand search --
+    # resolution only ever looks at the already-shown list's own name/brand text, never
+    # the wider catalog.
+    checkout_request: bool = False  # Sprint 6 checkout task; cart/direct-checkout
+    # architecture task (correction, matches final llm.py SYSTEM_PROMPT semantics):
+    # the message asks to FINALIZE a purchase/checkout/pay -- by position
+    # ("checkout the third one"), by a vague reference ("I want to buy it",
+    # "عايز اشتريه"), OR BY A SPECIFIC NAME ("buy Pepsi", "checkout Pepsi") -- or to
+    # checkout the cart ("checkout", "checkout all"). An OPEN-ENDED new shopping
+    # requirement stays a normal search instead ("I want to buy some milk" -- a broad
+    # category, not a specific item reference -- this stays false). When set alongside
+    # selection_ordinals/selection_last/selection_text, that field is only a CANDIDATE
+    # reference in the user's own words, never a claim that it is really shown, in the
+    # cart, or exists at all. Whether a real product is actually available to check
+    # out -- one shown/cart product directly, or the session's cart (empty/one/many/a
+    # named subset) -- is decided entirely deterministically downstream
+    # (src/scenario/orchestrator.py); this field only signals the user's intent to
+    # finalize, never a product choice, cart membership, or a completed order.
+    cart_action: Literal["add", "view", "remove", "clear", "update_quantity"] | None = None
+    # Cart/direct-checkout architecture task: ONE coherent commerce-action field
+    # (never several independent booleans) for the user's cart intent, orthogonal to
+    # `intent` exactly like checkout_request/memory_recall/selection_* above.
+    # "add"/"remove"/"update_quantity" reuse selection_ordinals/selection_last/
+    # selection_text for WHICH product(s) -- never a second product-reference
+    # mechanism. "view"/"clear" need no product reference. Real product/cart
+    # membership/price are always resolved deterministically downstream; this field
+    # only signals which cart operation was asked for. Null for anything else,
+    # including a plain "buy X"/"checkout X" (that is checkout_request +
+    # selection_text -- a purchase candidate, never a cart action just because a
+    # product was named) and a bare "checkout" (checkout_request, not this).
+    quantity: int | None = None  # Cart/direct-checkout architecture task: an
+    # explicit quantity NUMBER the user actually stated ("add 3 Pepsi to cart",
+    # "make Pepsi quantity 3", "change the second item to 2") -- reused for both
+    # cart_action="add" (how many to add) and cart_action="update_quantity" (the
+    # new total). Never invented when no number was said; downstream validation
+    # (>=1, whole number) is deterministic, matching src/checkout/demo_order.py's
+    # existing validate_quantity() rule.
 
     @model_validator(mode="after")
     def _target_facet_only_meaningful_for_remove_filter(self) -> "Action":

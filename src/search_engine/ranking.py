@@ -101,6 +101,36 @@ def bm25_score(index: SearchIndex, doc_id: int, query_tokens: list[str]) -> floa
     return score
 
 
+def corpus_cooccurrence_ids(index: SearchIndex, words: list[str]) -> set[int]:
+    """Real product IDs whose own tokenization contains ALL of `words`
+    together (set intersection over SearchIndex.postings). Word-order-
+    agnostic on purpose: a real catalog title often states a well-
+    attested phrase in a different order than a customer's query
+    ("Olive Oil Extra Virgin" vs "Extra Virgin Olive Oil").
+
+    The single shared low-level primitive for "does the catalog actually
+    combine these words" -- src/search_engine/keyword_baseline.py's
+    _corpus_cooccurrence_ids() (used by the out-of-catalog gate and fuzzy
+    category/brand grounding) is a thin wrapper around this exact
+    function, and src/search_adapter/adapter.py's fusion-skip check uses
+    it directly. Lives here, not in keyword_baseline.py, specifically so
+    adapter.py can use it without a circular import: keyword_baseline.py
+    itself imports FROM src.search_adapter.adapter, so adapter.py
+    importing back from keyword_baseline.py would be circular; ranking.py
+    sits BELOW both (only src.search_engine.index/tokenizer), so either
+    module can safely import from here."""
+    ids: set[int] | None = None
+    for w in words:
+        toks = tokenize(w, index.base_freq)
+        if not toks:
+            return set()
+        pids = index.postings.get(toks[0], set())
+        ids = pids if ids is None else (ids & pids)
+        if not ids:
+            return set()
+    return ids if ids is not None else set()
+
+
 def rank(
     index: SearchIndex,
     candidate_ids: set[int],
@@ -138,7 +168,23 @@ def rank(
         if sku and sku in (query_text or ""):
             score += EXACT_SKU_BOOST
         url_key_tokens = index.doc_url_key_tokens.get(pid, set())
-        score += URL_KEY_TOKEN_BOOST * len(query_token_set & url_key_tokens)
+        if url_key_tokens:
+            # Sprint 6 product-identity relevance task: scaled by how much
+            # of THIS product's own url_key the query actually covers
+            # (query-to-title precision), not a flat per-token add. A flat
+            # add rewarded any product whose marketing-style slug happens
+            # to spell out the query term exactly as much as one whose
+            # ENTIRE slug is that term -- real measured symptom: a generic
+            # single-word query ("watermelon") got the SAME +2.0 for a
+            # slug that is 1/6 query-related ("vidal-candy-belts-with-
+            # watermelon-100g") as it would for a slug that IS the query,
+            # systematically outranking genuine direct-identity products
+            # whose slug is a bare SKU number (0 tokens, 0 boost either
+            # way) purely on this mismatched weighting. Precision-scaling
+            # keeps the boost meaningful for an actual slug/name match
+            # while no longer treating an incidental mention the same as
+            # the product's own core identity.
+            score += URL_KEY_TOKEN_BOOST * len(query_token_set & url_key_tokens) / len(url_key_tokens)
         scored.append((pid, score))
 
     scored.sort(key=lambda pair: pair[1], reverse=True)

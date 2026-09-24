@@ -14,8 +14,8 @@ from src.scenario.decision import (  # noqa: E402
     RELAXATION_FACTOR,
     derive_recommendation_search,
     has_searchable_target,
+    normalize_recommendation_intent,
     normalize_target_facet,
-    repair_recommendation_price_no_op,
 )
 from src.scenario.session_activity import SessionActivity  # noqa: E402
 from src.search_adapter.adapter import FilterSet  # noqa: E402
@@ -73,11 +73,16 @@ def test_has_searchable_target(filters, expected):
     assert has_searchable_target(filters) == expected
 
 
-# --- recommendation + concrete price NO_OP repair ---
+# --- recommendation intent normalization (normalize_recommendation_intent) ---
+# ONE function, two mutually-exclusive directions (action.intent can never be
+# both NO_OP and a state-changing intent at once): direction 1 repairs a
+# NO_OP that should have been a real intent because a price WAS stated;
+# direction 2 (Sprint 6 recommendation-context task) repairs a state-
+# changing intent that should have been NO_OP because NOTHING was stated.
 
 def test_repair_empty_state_becomes_search():
     action = Action(intent=Intent.NO_OP, recommendation_request=True, price_max=100.0)
-    result = repair_recommendation_price_no_op(action, FilterSet())
+    result = normalize_recommendation_intent(action, FilterSet())
     assert result.intent == Intent.SEARCH
     assert result.price_max == 100.0
     assert result.recommendation_request is True
@@ -86,7 +91,7 @@ def test_repair_empty_state_becomes_search():
 def test_repair_existing_target_no_price_becomes_add_filter():
     action = Action(intent=Intent.NO_OP, recommendation_request=True, price_max=100.0)
     current = FilterSet(category="lotion_1")
-    result = repair_recommendation_price_no_op(action, current)
+    result = normalize_recommendation_intent(action, current)
     assert result.intent == Intent.ADD_FILTER
     assert result.price_max == 100.0
 
@@ -94,14 +99,14 @@ def test_repair_existing_target_no_price_becomes_add_filter():
 def test_repair_existing_target_with_price_becomes_modify_filter():
     action = Action(intent=Intent.NO_OP, recommendation_request=True, price_max=100.0)
     current = FilterSet(category="lotion_1", price_max=150.0)
-    result = repair_recommendation_price_no_op(action, current)
+    result = normalize_recommendation_intent(action, current)
     assert result.intent == Intent.MODIFY_FILTER
     assert result.price_max == 100.0
 
 
 def test_repair_does_not_fire_for_bare_recommendation():
     action = Action(intent=Intent.NO_OP, recommendation_request=True)
-    result = repair_recommendation_price_no_op(
+    result = normalize_recommendation_intent(
         action, FilterSet(category="lotion_1", price_max=100.0)
     )
     assert result.intent == Intent.NO_OP
@@ -109,22 +114,75 @@ def test_repair_does_not_fire_for_bare_recommendation():
 
 def test_repair_does_not_fire_for_show_me_more_with_no_new_price():
     action = Action(intent=Intent.NO_OP, recommendation_request=True, raw_query_text=None)
-    result = repair_recommendation_price_no_op(
+    result = normalize_recommendation_intent(
         action, FilterSet(category="lotion_1", price_max=100.0)
     )
     assert result.intent == Intent.NO_OP
 
 
-def test_repair_does_not_fire_for_non_no_op_intents():
+def test_repair_does_not_fire_for_non_no_op_intents_that_already_state_a_value():
     action = Action(intent=Intent.SEARCH, price_max=100.0)
-    result = repair_recommendation_price_no_op(action, FilterSet())
+    result = normalize_recommendation_intent(action, FilterSet())
     assert result.intent == Intent.SEARCH
 
 
 def test_repair_does_not_fire_without_recommendation_request():
     action = Action(intent=Intent.NO_OP, recommendation_request=False, price_max=100.0)
-    result = repair_recommendation_price_no_op(action, FilterSet())
+    result = normalize_recommendation_intent(action, FilterSet())
     assert result.intent == Intent.NO_OP
+
+
+# --- direction 2: an empty state-changing recommendation request becomes NO_OP ---
+
+def test_empty_search_with_recommendation_request_becomes_no_op():
+    # the real live-confirmed shape for "recommend me more"
+    action = Action(intent=Intent.SEARCH, recommendation_request=True)
+    result = normalize_recommendation_intent(action, FilterSet(category="chips_1", price_min=20.0))
+    assert result.intent == Intent.NO_OP
+    assert result.recommendation_request is True
+
+
+def test_empty_add_filter_and_modify_filter_with_recommendation_request_become_no_op():
+    for intent in (Intent.ADD_FILTER, Intent.MODIFY_FILTER):
+        action = Action(intent=intent, recommendation_request=True)
+        result = normalize_recommendation_intent(action, FilterSet())
+        assert result.intent == Intent.NO_OP
+
+
+def test_search_with_new_query_and_recommendation_request_is_not_forced_to_no_op():
+    action = Action(intent=Intent.SEARCH, raw_query_text="chocolate", recommendation_request=True)
+    result = normalize_recommendation_intent(action, FilterSet(query_text="chips"))
+    assert result.intent == Intent.SEARCH
+    assert result.raw_query_text == "chocolate"
+
+
+def test_search_with_new_category_or_brand_and_recommendation_request_is_not_forced_to_no_op():
+    action = Action(intent=Intent.SEARCH, category_hint="chocolate", recommendation_request=True)
+    result = normalize_recommendation_intent(action, FilterSet(query_text="chips"))
+    assert result.intent == Intent.SEARCH
+
+    action2 = Action(intent=Intent.ADD_FILTER, brand_text="lindt", recommendation_request=True)
+    result2 = normalize_recommendation_intent(action2, FilterSet(query_text="chocolate"))
+    assert result2.intent == Intent.ADD_FILTER
+
+
+def test_search_with_new_price_and_recommendation_request_is_not_forced_to_no_op():
+    action = Action(intent=Intent.SEARCH, price_max=100.0, recommendation_request=True)
+    result = normalize_recommendation_intent(action, FilterSet(query_text="chips"))
+    assert result.intent == Intent.SEARCH
+    assert result.price_max == 100.0
+
+
+def test_empty_search_without_recommendation_request_is_untouched():
+    action = Action(intent=Intent.SEARCH)
+    result = normalize_recommendation_intent(action, FilterSet(query_text="chips"))
+    assert result.intent == Intent.SEARCH
+
+
+def test_ordinary_search_with_a_stated_value_and_no_recommendation_request_is_unchanged():
+    action = Action(intent=Intent.SEARCH, raw_query_text="milk", category_hint="milk")
+    result = normalize_recommendation_intent(action, FilterSet())
+    assert result is action  # untouched, same object -- not even copied
 
 
 # --- recommendation relaxation (Sprint 4 Part 2 micro-correction: each step

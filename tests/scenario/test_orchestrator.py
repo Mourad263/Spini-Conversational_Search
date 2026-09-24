@@ -303,11 +303,13 @@ def test_recommendation_exploration_price_bands():
     assert r1.effective_price_max == 120.0
     assert r1.price_max == 100.0  # canonical, unchanged
     assert sm.get_state("s1").price_max == 100.0
-    # Sprint 6: each NO_OP/recommendation turn now makes TWO real search
-    # calls -- one under the CANONICAL state (recommendation evidence, see
-    # _build_recommendations), one under the relaxed price band (the
-    # `products` display, unchanged). The LAST call is still always the
-    # band search.
+    # Each NO_OP/recommendation turn that actually widens a price band makes
+    # TWO real search calls -- one under the CANONICAL state (recommendation
+    # evidence, see _build_recommendations; a fresh search is still needed
+    # here because last_shown_products no longer reflects current_state once
+    # relaxation has run at least once), one under the relaxed price band
+    # (the `products` display). The LAST call is still always the band
+    # search.
     assert len(search.calls) == 3
     assert search.calls[-1].price_min == 100.0
     assert search.calls[-1].price_max == 120.0
@@ -350,11 +352,15 @@ def test_recommendation_without_price_uses_canonical_state_as_is():
 
     assert r2.effective_price_min is None
     assert r2.effective_price_max is None
-    # Sprint 6: +1 recommendation-evidence call under canonical state, on
-    # top of the pre-existing band search -- see the price-band test above.
-    assert len(search.calls) == 3
+    # Recommendation-continuation search-trace fix: no relaxation band was
+    # applied (nothing new to explore) and current_state hasn't changed
+    # since turn 1's own search, so recommendation evidence reuses
+    # last_shown_products instead of re-searching -- only the initial
+    # "milk" search (turn 1) remains, zero new calls for the continuation.
+    assert len(search.calls) == 1
     assert search.calls[-1].price_max is None
     assert search.calls[-1].category == "milk_29"
+    assert r2.products == []  # pure recommendation continuation, no re-displayed search list
 
 
 # --- G. empty recommendation ---

@@ -31,7 +31,7 @@ from src.ingestion.text_normalize import is_arabic, normalize_arabic, normalize_
 from src.models.config import settings  # noqa: E402
 from src.search_adapter.adapter import FilterSet, SearchAdapter, SearchResult  # noqa: E402
 from src.search_engine.index import get_index  # noqa: E402
-from src.search_engine.tokenizer import tokenize  # noqa: E402
+from src.search_engine.ranking import corpus_cooccurrence_ids, correct_unmatched_terms  # noqa: E402
 
 _MAX_PATTERNS = [
     re.compile(r"\bunder\s+(\d+(?:\.\d+)?)", re.IGNORECASE),
@@ -155,31 +155,38 @@ _MIN_PRODUCT_COOCCURRENCE_SUPPORT = 3
 # boundary, it has real room on both sides.
 _MIN_CANDIDATE_OVERLAP_RATIO = 0.1
 
+# Sprint 6 out-of-catalog grounding follow-up: the score a window with ZERO
+# real corpus occurrence of its own must clear before its match is trusted
+# (see _fuzzy_phrase_match) -- higher than _CATEGORY_FUZZY_THRESHOLD/
+# _BRAND_FUZZY_THRESHOLD (80), but NOT a blind guess. A pure edit-distance
+# cutoff was tried first and rejected: standard Levenshtein counts an
+# ordinary adjacent-letter transposition ("chocoalte"/chocolate,
+# "spinnies"/spinneys, "لحمة معلبة"/"لحوم معلبة" -- all genuine, all
+# distance 2) the SAME as the confirmed bug ("phone"/"Honey", also distance
+# 2), so distance alone can't separate them. Their fuzz.ratio SCORES do
+# separate cleanly, though: every one of those genuine unattested cases
+# scores >=87.5, while the confirmed bug scores exactly 80.0 -- a real,
+# measured gap. This constant sits just above the confirmed-bug ceiling
+# (not near the genuine floor), the same "err toward keeping real matches"
+# convention vector_search.py's own VECTOR_FALLBACK_MAX_DISTANCE already
+# uses: it excludes the specific coincidences found so far while giving
+# every currently-known genuine case a wide (5.5+ point) safety margin,
+# at the disclosed cost of not catching a hypothetical future coincidence
+# that happens to score 82-87.
+_UNATTESTED_WINDOW_MIN_SCORE = 82
+
 
 def _corpus_cooccurrence_ids(words: list[str]) -> set[int]:
     """Real product IDs whose (name_en + name_ar) tokenization contains
-    ALL of `words` (set intersection over SearchIndex.postings). Reuses
-    the SAME corpus-frequency structure src/search_engine/ranking.py's
-    correct_unmatched_terms already relies on for spelling-correction
-    safety -- deliberately not a second, separate vocabulary system
-    (Sprint 6 section 5). Word-order-agnostic on purpose: real catalog
-    product titles often store a real, well-attested phrase in a
-    different word order than a customer's query ("Olive Oil Extra
-    Virgin" in the catalog vs "Extra Virgin Olive Oil" as typed) -- the
-    underlying concept's reality doesn't depend on which word came
-    first, and BM25 retrieval in this same system is already word-order-
-    agnostic too."""
-    idx = get_index()
-    ids: set[int] | None = None
-    for w in words:
-        toks = tokenize(w, idx.base_freq)
-        if not toks:
-            return set()
-        pids = idx.postings.get(toks[0], set())
-        ids = pids if ids is None else (ids & pids)
-        if not ids:
-            return set()
-    return ids if ids is not None else set()
+    ALL of `words` together. Thin wrapper over
+    src/search_engine/ranking.py's corpus_cooccurrence_ids() -- the ONE
+    shared implementation of this postings-intersection primitive, also
+    used directly by src/search_adapter/adapter.py's fusion-skip check.
+    Kept here, under this exact name, purely so this module's existing
+    callers (this module's own fuzzy grounding, src/scenario/
+    orchestrator.py's out-of-catalog gate, src/recommendation/service.py)
+    need no changes."""
+    return corpus_cooccurrence_ids(get_index(), words)
 
 
 def _corpus_cooccurrence_support(words: list[str]) -> int:
@@ -454,6 +461,7 @@ def _fuzzy_phrase_match(
     protected_threshold: float = 95.0,
     candidate_product_ids: dict[str, set[int]] | None = None,
     corpus_protection: bool = True,
+    strict_unattested: bool = False,
 ) -> tuple[str | None, str, int]:
     """Shared typo/near-miss tolerant matcher (rapidfuzz edit-distance
     ratio) used by both brand and category detection -- same algorithm,
@@ -552,7 +560,28 @@ def _fuzzy_phrase_match(
     A genuinely near-exact/exact real brand or category name (e.g.
     "Extra" typed alone, or a real typo like "milqa") is unaffected by
     either mechanism, since typos have ~0 corpus support and real short
-    brand names are still free to win at protected_threshold or above."""
+    brand names are still free to win at protected_threshold or above.
+
+    strict_unattested (Sprint 6 out-of-catalog grounding follow-up):
+    additionally escalates a window with ZERO corpus occurrence of its OWN
+    (not just well-attested-but-mismatched) to _UNATTESTED_WINDOW_MIN_SCORE.
+    Deliberately opt-in, used ONLY by the role-aware conversational
+    resolvers (resolve_category_hint/resolve_brand_text) -- NOT by
+    parse_keyword_query's free-sentence scanning (_find_fuzzy_category/
+    _find_fuzzy_brand's own default calls). Measured directly why this must
+    stay scoped: parse_keyword_query's full-catalog typo sweep
+    (tests/integration/test_category_fuzzy.py) generates thousands of
+    single-character-substitution typos on real, often short, brand/
+    category names -- the overwhelming majority have ZERO literal corpus
+    occurrence of their OWN misspelled form (a random substitution rarely
+    happens to spell another real corpus word), so "unattested" is the
+    NORMAL shape of an ordinary short-word typo in that context, not a red
+    flag; turning this on there measured cat_typo/brand_typo recall
+    collapsing (0.78->0.74, 0.77->0.64). The conversational resolvers see a
+    different, much narrower input instead -- a short, deliberate LLM-
+    extracted phrase naming ONE concept -- where the real bug this closes
+    (category_hint "mobile phone" hijacking the unrelated category
+    "Honey") actually lives; see _UNATTESTED_WINDOW_MIN_SCORE."""
     words = text.split()
     if not words:
         return None, text, 0
@@ -577,6 +606,17 @@ def _fuzzy_phrase_match(
             # has already said so explicitly there is nothing left to guess.
             window_ids = _corpus_cooccurrence_ids(words[start:end]) if corpus_protection else set()
             window_is_well_attested = len(window_ids) >= _MIN_PRODUCT_COOCCURRENCE_SUPPORT
+            # Sprint 6 out-of-catalog grounding follow-up: a window with ZERO
+            # real corpus occurrence of its own is held to
+            # _UNATTESTED_WINDOW_MIN_SCORE instead of the plain (lower)
+            # threshold, which previously gave it LESS scrutiny than a
+            # well-attested-but-mismatched window. Real bug this closes:
+            # category_hint "mobile phone" -> the single-word sub-window
+            # "phone" scores exactly 80.0 against the unrelated real
+            # category "Honey", and "phone" occurs in ZERO real products --
+            # see _UNATTESTED_WINDOW_MIN_SCORE for why this is a score
+            # threshold, not an edit-distance one.
+            window_is_unattested = strict_unattested and corpus_protection and not window_ids
             scored_windows = [transform(window) for transform in window_transforms]
             for slug, norm_forms in candidates:
                 effective_threshold = base_effective_threshold
@@ -584,6 +624,8 @@ def _fuzzy_phrase_match(
                     candidate_ids = candidate_product_ids.get(slug) if candidate_product_ids else None
                     if _corpus_overlap_ratio(window_ids, candidate_ids) < _MIN_CANDIDATE_OVERLAP_RATIO:
                         effective_threshold = max(effective_threshold, protected_threshold)
+                elif window_is_unattested:
+                    effective_threshold = max(effective_threshold, _UNATTESTED_WINDOW_MIN_SCORE)
                 score = max(fuzz.ratio(w, n) for w, n in zip(scored_windows, norm_forms))
                 if score >= effective_threshold and (best is None or (score, length) > (best[0], best[1])):
                     best = (score, length, slug, start, end)
@@ -736,6 +778,7 @@ _CATEGORY_FUZZY_BLOCKLIST_NORM = {_normalize_for_fuzzy(w) for w in _CATEGORY_FUZ
 def _find_fuzzy_category(
     text: str, category_candidates: list[tuple[str, str, str]],
     blocklist_norm: frozenset[str] = _CATEGORY_FUZZY_BLOCKLIST_NORM,
+    strict_unattested: bool = False,
 ) -> tuple[str | None, str, int]:
     """Fallback for when the exact/definite-article-tolerant match
     (_extract_first_phrase_match) finds nothing -- catches a genuine
@@ -761,7 +804,8 @@ def _find_fuzzy_category(
     return _fuzzy_phrase_match(text, candidates, _CATEGORY_FUZZY_THRESHOLD,
                                 blocklist_norm, _CATEGORY_MAX_PHRASE_WORDS,
                                 window_transforms=(lambda w: w, _strip_leading_al_per_word),
-                                candidate_product_ids=_get_catalog_names()["product_ids_by_category_slug"])
+                                candidate_product_ids=_get_catalog_names()["product_ids_by_category_slug"],
+                                strict_unattested=strict_unattested)
 
 
 _CATEGORY_SINGULAR_ALIAS_SLUGS = set(_CATEGORY_SINGULAR_ALIASES.keys())
@@ -1105,14 +1149,41 @@ def resolve_brand_text(brand_text: str | None) -> str | None:
     Bawadi" -- a coincidental fuzzy lookalike, exactly the failure shape
     corpus protection exists to catch, and knowing the ROLE is "brand"
     does not settle WHICH brand any more than knowing the role is
-    "category" settles which category (see resolve_category_hint)."""
+    "category" settles which category (see resolve_category_hint).
+
+    Falls back to the SAME general corpus spelling-corrector
+    ranking.py's free-text search path already relies on
+    (correct_unmatched_terms) when the direct fuzzy attempt above finds
+    nothing -- real gap this closes: a one-substitution brand typo
+    ("pebsi") scores exactly _BRAND_FUZZY_THRESHOLD (80) against its real
+    target ("pepsi"), but the unattested-window protection above (needed
+    for "fruit"/"phone"-shaped false positives) raises the effective
+    threshold to _UNATTESTED_WINDOW_MIN_SCORE (82) whenever the typo
+    itself -- as any genuine typo will -- has zero corpus presence of its
+    own, silently rejecting a correction the corpus already proves is
+    safe. correct_unmatched_terms answers a DIFFERENT, more precise
+    question (does the CANDIDATE correction have real, well-attested
+    support -- SPELLING_CORRECTION_MIN_TARGET_DOCS=3), so a corrected
+    word is re-checked through the exact same corpus-protected fuzzy
+    match above, not trusted directly -- it can only ever resolve to a
+    brand that already independently clears every existing safety net."""
     if not brand_text or not brand_text.strip():
         return None
     catalog = _get_catalog_names()
     candidates = [(b["slug"], [b["norm"]]) for b in catalog["brands"]]
     slug, _remaining, _length = _fuzzy_phrase_match(
         brand_text, candidates, _BRAND_FUZZY_THRESHOLD, set(), _BRAND_MAX_PHRASE_WORDS,
-        corpus_protection=True,
+        corpus_protection=True, strict_unattested=True,
+    )
+    if slug is not None:
+        return slug
+
+    corrected = correct_unmatched_terms(get_index(), brand_text)
+    if not corrected:
+        return None
+    slug, _remaining, _length = _fuzzy_phrase_match(
+        corrected, candidates, _BRAND_FUZZY_THRESHOLD, set(), _BRAND_MAX_PHRASE_WORDS,
+        corpus_protection=True, strict_unattested=True,
     )
     return slug
 
@@ -1147,7 +1218,8 @@ def resolve_category_hint(category_hint: str | None) -> str | None:
     # arbitrary sentence -- the generic corpus-overlap check above is what
     # protects this path, not a hand-curated word list.
     slug, _remaining, _length = _find_fuzzy_category(
-        category_hint, catalog["category_candidates"], blocklist_norm=frozenset()
+        category_hint, catalog["category_candidates"], blocklist_norm=frozenset(),
+        strict_unattested=True,
     )
     return slug
 

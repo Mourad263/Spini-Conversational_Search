@@ -72,21 +72,40 @@ class StateManager:
             price_min = resolved.price_min if resolved.price_min is not None else current.price_min
             price_max = resolved.price_max if resolved.price_max is not None else current.price_max
             if action.intent == Intent.MODIFY_FILTER:
-                # A turn that explicitly modifies ONE price bound past the
-                # OTHER bound's still-retained value ("min=20,max=50" then
-                # MODIFY min=100) means that retained bound is now stale,
-                # not a real both-bounds contradiction -- there is no
-                # signal in this turn's Action asking to change it too, so
-                # silently keeping it would otherwise construct an invalid
-                # FilterSet and let InvalidFilterError escape apply()
-                # uncaught (confirmed: a real crash on this exact input).
                 # Scoped to modify_filter only -- add_filter genuinely
                 # adding a contradictory bound is a different, out-of-scope
                 # case (research.md).
-                if resolved.price_min is not None and price_max is not None and price_min > price_max:
-                    price_max = None
-                elif resolved.price_max is not None and price_min is not None and price_min > price_max:
-                    price_min = None
+                #
+                # Shape-aware, not numeric-aware: whether a stale bound
+                # survives depends on what kind of price facet was ACTIVE
+                # before this turn, not on whether the new number happens
+                # to numerically clash with it.
+                #
+                # If the facet was already ONE-SIDED (only a min or only a
+                # max was ever stated) and this turn states the OPPOSITE
+                # side alone, the user has changed direction entirely --
+                # "under 200" then "above 150" means "price_min=150" full
+                # stop, not an accidental 150-200 range, even though 150
+                # does not numerically contradict 200. The old side is
+                # always dropped here, unconditionally.
+                #
+                # Otherwise -- the facet was already a genuine two-sided
+                # range, or this turn's new bound is on the SAME side that
+                # was already active -- the previous side is only dropped
+                # when keeping it would be a real numeric contradiction
+                # (min >= max). A compatible adjustment to one side of an
+                # explicit range ("100-200" -> modify max to 250) keeps the
+                # other side untouched.
+                if resolved.price_min is not None and resolved.price_max is None:
+                    if current.price_min is None and current.price_max is not None:
+                        price_max = None  # one-sided direction flip
+                    elif price_max is not None and price_min >= price_max:
+                        price_max = None  # genuine numeric contradiction
+                elif resolved.price_max is not None and resolved.price_min is None:
+                    if current.price_max is None and current.price_min is not None:
+                        price_min = None  # one-sided direction flip
+                    elif price_min is not None and price_min >= price_max:
+                        price_min = None  # genuine numeric contradiction
             new_state = FilterSet(
                 category=resolved.category if resolved.category is not None else current.category,
                 brand=resolved.brand if resolved.brand is not None else current.brand,

@@ -37,6 +37,22 @@ def hard_filter(
     where = ["1=1"]
     params: list = []
 
+    # Sprint 6 effective-price consistency task: the same rule display and
+    # checkout now use (src/checkout/demo_order.py's _unit_price(),
+    # frontend/src/components/ProductCard.jsx's hasSpecial) -- special_price
+    # is a real discount only when it's positive (0 is this catalog's own
+    # "no special price recorded" sentinel, proven directly against the DB:
+    # special_price > price never occurs; special_price == price is the
+    # normal no-discount shape), otherwise the regular price applies.
+    effective_price = "(CASE WHEN p.special_price > 0 THEN p.special_price ELSE p.price END)"
+
+    if price_min is not None or price_max is not None:
+        # A product with no valid positive effective price (both price and
+        # special_price are 0 -- a real ~78-row ingestion gap, not a
+        # genuine free item) is UNKNOWN, not "under any bound" -- it must
+        # never satisfy a bounded price query merely because 0 <= max.
+        where.append(f"{effective_price} > 0")
+
     if category_slug is not None:
         where.append("""
             EXISTS (
@@ -49,11 +65,11 @@ def hard_filter(
         params.append(category_slug)
 
     if price_min is not None:
-        where.append("p.price >= %s")
+        where.append(f"{effective_price} >= %s")
         params.append(price_min)
 
     if price_max is not None:
-        where.append("p.price <= %s")
+        where.append(f"{effective_price} <= %s")
         params.append(price_max)
 
     if brand is not None:
@@ -82,3 +98,25 @@ def hard_filter(
         cur.execute(sql, params)
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def product_by_id(product_id: int) -> dict | None:
+    """Final UI task: server-authoritative single-product lookup by primary
+    key -- the SAME row shape hard_filter() returns. Reused by the
+    deterministic, button-driven cart-mutation endpoint (src/scenario/
+    cart_mutation.py) so a UI button's product_id is always resolved
+    against real catalog data; name/price are never trusted from the
+    client. Returns None when the id doesn't exist."""
+    sql = """
+        SELECT p.id, p.name_en, p.name_ar, p.price, p.special_price,
+               p.brand_normalized, p.url_key, p.sku
+        FROM product p
+        WHERE p.id = %s
+    """
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, (product_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d.name for d in cur.description]
+        return dict(zip(cols, row))

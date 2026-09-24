@@ -30,6 +30,7 @@ from pgvector.psycopg import register_vector  # noqa: E402
 from src.models.config import settings  # noqa: E402
 from src.search_adapter.adapter import FilterSet  # noqa: E402
 from src.search_engine.embeddings import embed  # noqa: E402
+from src.search_engine.keyword_baseline import _corpus_cooccurrence_ids  # noqa: E402
 from src.search_engine.query import hard_filter  # noqa: E402
 
 KMEANS_ARTIFACT_PATH = Path(__file__).resolve().parent / "artifacts" / "product_kmeans_128.joblib"
@@ -118,6 +119,25 @@ class RecommendationService:
         filtered_rows = hard_filter(active_filters.category, active_filters.price_min,
                                      active_filters.price_max, active_filters.brand)
         filtered_by_id = {row["id"]: row for row in filtered_rows}
+
+        # hard_filter() only enforces STRUCTURED facets (category/price/
+        # brand) -- it has no concept of the free-text product identity in
+        # query_text. When neither category nor brand ever grounded for the
+        # active search (a real, common case -- see validate.py), the active
+        # PRODUCT IDENTITY lives ONLY in query_text, and without reusing it
+        # here too, "candidates" collapses to "anything in the price range,"
+        # silently abandoning the current shopping topic (current-context-
+        # recommendations fix). Reuses the SAME corpus-postings evidence
+        # orchestrator.py's out-of-catalog gate already relies on -- no new
+        # vocabulary system, no query-specific rule. Only ever NARROWS an
+        # already-hard_filter()-passing set; never widens past it, and never
+        # zeroes it out on inconclusive (empty) text evidence -- a query
+        # that reached this point already cleared the out-of-catalog gate.
+        if active_filters.category is None and active_filters.brand is None and query_text:
+            text_ids = _corpus_cooccurrence_ids(query_text.split())
+            if text_ids:
+                filtered_by_id = {pid: row for pid, row in filtered_by_id.items() if pid in text_ids}
+
         candidate_idx = np.array([i for i in candidate_idx if int(self._pids[i]) in filtered_by_id])
         if len(candidate_idx) == 0:
             return []

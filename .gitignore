@@ -1,7 +1,36 @@
+# Secrets / local env
 .env
+.env.*
+!.env.example
+!frontend/.env.example
+
+# Python
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+
+# Logs
 *.log
+*.err.log
+
+# Large data / runtime output
 data/spinneys_database.sql
+data/orders/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.development
+
+# Local-only files
+.claude/scheduled_tasks.lock
+project_tree.txt
+orchestrator_refactor.diff
+to_run.txt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -15,8 +15,15 @@ from src.recommendation.service import get_recommendation_service  # noqa: E402
 from src.scenario.orchestrator import handle_message  # noqa: E402
 from src.scenario.session_activity import SessionActivityStore  # noqa: E402
 from src.search_adapter.adapter import FilterSet, SearchAdapter, SearchResult  # noqa: E402
+from src.search_engine.keyword_baseline import _corpus_cooccurrence_ids  # noqa: E402
+from src.search_engine.query import hard_filter  # noqa: E402
 from src.state_manager.state_manager import StateManager  # noqa: E402
 from src.understanding.schema import Action, Intent  # noqa: E402
+from src.validation.validate import validate  # noqa: E402
+
+
+def understand_must_not_be_called(message: str, history: list[str] | None = None) -> Action:
+    raise AssertionError(f"understand() was called: {message!r}")
 
 
 def stub_understand(*actions: Action):
@@ -166,6 +173,25 @@ def test_recommendation_service_empty_ids_is_safe():
     assert service.recommend("milk", [-1, -2], FilterSet(category="milk_29"), limit=5) == []  # invalid ids
 
 
+def test_recommendation_service_grounds_by_query_text_when_category_and_brand_unresolved():
+    """Service-level, isolated from the orchestrator: an ungrounded-category
+    FilterSet (category=None, brand=None) must not let hard_filter()'s
+    price-only enforcement leak unrelated products into candidates -- the
+    free-text query identity is the only remaining evidence of what the
+    product actually is, and it must still constrain candidates."""
+    fs = validate(Action(intent=Intent.SEARCH, raw_query_text="deodorant", price_min=200.0))
+    assert fs.category is None and fs.brand is None  # exercises the exact ungrounded shape
+    base = SearchAdapter().search(fs, limit=10, offset=0)
+    shown_ids = [p["id"] for p in base.products]
+
+    recs = get_recommendation_service().recommend(fs.query_text, shown_ids, fs, limit=8)
+
+    text_ids = _corpus_cooccurrence_ids(["deodorant"])
+    assert len(recs) > 0
+    for r in recs:
+        assert r["id"] in text_ids
+
+
 # 11. "what do you recommend?" after an active search -- uses existing
 # state, must NOT mutate it.
 def test_bare_recommendation_after_active_search_uses_state_without_mutating_it():
@@ -202,6 +228,87 @@ def test_search_and_recommendation_in_the_same_turn():
     assert r.price_max == 50.0
     assert len(r.products) > 0  # normal search still happened
     assert len(r.recommendations) > 0  # AND recommendations were generated from it
+
+
+# 14. current-context recommendation grounding (Sprint 7 fix): a
+# recommendation request must stay inside the ACTIVE shopping topic even
+# when that topic's product concept never resolved to a canonical category
+# slug -- hard_filter() alone enforces nothing in that shape (category=
+# None, brand=None), so recommendations must also respect the free-text
+# query identity instead of silently falling back to "anything in the
+# price range."
+
+def test_direct_recommendation_stays_grounded_when_category_never_resolved():
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(
+        # category_hint intentionally omitted -- exercises the real, common
+        # shape where a product concept never grounds to a canonical
+        # category slug: validate() leaves category=None, and query_text=
+        # "deodorant" is the only surviving signal (this is exactly how the
+        # ORIGINAL search still finds real deodorant products via BM25
+        # despite no canonical category).
+        Action(intent=Intent.SEARCH, raw_query_text="deodorant", price_min=200.0),
+        Action(intent=Intent.NO_OP, recommendation_request=True),
+    )
+    handle_message("s20", "i want a deodorant above 200", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=RecordingSearch())
+    state = sm.get_state("s20")
+    assert state.category is None  # confirms this test exercises the ungrounded shape
+    assert state.query_text == "deodorant"
+
+    r = handle_message("s20", "recommend me some other types", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=RecordingSearch())
+
+    assert len(r.recommendations) > 0
+    text_ids = _corpus_cooccurrence_ids(["deodorant"])
+    for p in r.recommendations:
+        assert p.id in text_ids  # never an unrelated catalog product (cake/soy sauce/etc.)
+    # recommendations supersede the old selectable context (criterion 11)
+    assert {p.id for p in r.recommendations} == {p.id for p in store.get("s20").last_shown_products}
+
+
+def test_recommendation_follows_latest_topic_not_older_history():
+    # milk -> chocolate -> "recommend me": must follow chocolate, never
+    # contaminate the profile with the earlier, now-abandoned milk topic.
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(
+        Action(intent=Intent.SEARCH, raw_query_text="milk", category_hint="milk"),
+        Action(intent=Intent.SEARCH, raw_query_text="chocolate", category_hint="chocolate"),
+        Action(intent=Intent.NO_OP, recommendation_request=True),
+    )
+    handle_message("s21", "milk", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=RecordingSearch())
+    handle_message("s21", "chocolate", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=RecordingSearch())
+    state = sm.get_state("s21")
+    assert state.category not in (None, "milk_29")  # topic genuinely switched, milk fully replaced
+
+    r = handle_message("s21", "recommend me", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=RecordingSearch())
+
+    assert len(r.recommendations) > 0
+    chocolate_ids = {row["id"] for row in hard_filter(state.category, None, None, None)}
+    for p in r.recommendations:
+        assert p.id in chocolate_ids  # never a leftover milk product
+
+
+def test_proactive_offer_acceptance_stays_grounded_when_category_never_resolved():
+    # Same current-context principle for the OTHER recommendation path
+    # (proactive offer -> bare "yes"), which must not drift semantically
+    # from the direct-request path above.
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="deodorant", price_min=200.0))
+    handle_message("s22", "i want a deodorant above 200", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=RecordingSearch())
+    assert store.get("s22").pending_action is not None
+
+    r = handle_message("s22", "yes", state_manager=sm, activity_store=store,
+                        understand_fn=understand_must_not_be_called, search_fn=RecordingSearch())
+
+    assert len(r.recommendations) > 0
+    text_ids = _corpus_cooccurrence_ids(["deodorant"])
+    for p in r.recommendations:
+        assert p.id in text_ids
 
 
 # 13. off-topic unchanged

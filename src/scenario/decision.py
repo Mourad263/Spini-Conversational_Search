@@ -43,34 +43,66 @@ def has_searchable_target(filters: FilterSet) -> bool:
     return filters.query_text is not None or filters.category is not None or filters.brand is not None
 
 
-def repair_recommendation_price_no_op(action: Action, current_state: FilterSet) -> Action:
-    """Known real LLM boundary case (Sprint 4 Part 1 micro-verification):
-    gpt-5.4-mini can produce intent=NO_OP, recommendation_request=True,
-    with a concrete price bound stated on the CURRENT turn -- not a true
-    no-op, since the turn itself states a real value. Fires ONLY for this
-    exact shape; every other NO_OP (bare recommendation, "show me more",
-    ...) passes through completely unchanged. The effective intent is
-    chosen from the CURRENT canonical StateManager state, never guessed
-    by the LLM."""
-    if action.intent != Intent.NO_OP or not action.recommendation_request:
-        return action
-    if action.price_min is None and action.price_max is None:
+def normalize_recommendation_intent(action: Action, current_state: FilterSet) -> Action:
+    """ONE Action-normalization function for a single general concept: when
+    recommendation_request=True, the EFFECTIVE intent must reflect whether
+    the turn actually states a new concrete value, never the LLM's raw
+    intent label alone. Unifies two previously separate, mutually-
+    exclusive repairs (a real intent and NO_OP can never both be
+    action.intent at once, so exactly one branch below ever applies) --
+    both confirmed live, real gpt-5.4-mini boundary cases:
+
+    Direction 1 (NO_OP that should have been a real intent -- Sprint 4
+    Part 1 micro-verification): a concrete PRICE bound stated on the
+    CURRENT turn -- the only field confirmed to trigger this shape live --
+    means the turn is not a true no-op. The effective intent is chosen
+    from the CURRENT canonical StateManager state, never guessed by the
+    LLM.
+
+    Direction 2 (a state-changing intent that should have been NO_OP --
+    Sprint 6 recommendation-context task): NO field at all is stated
+    (raw_query_text/category_hint/brand_text/free_from/price_min/
+    price_max all null) -- a pure recommendation-continuation phrase
+    ("recommend me more") misclassified as a fresh SEARCH, which would
+    otherwise let StateManager.apply() wipe the active canonical state
+    (e.g. "chips", price>=20) for no reason.
+
+    Every other shape -- recommendation_request=False, a NO_OP that
+    states nothing, or a real intent that already states a new product/
+    category/brand/price -- passes through completely unchanged; only
+    these two exact, evidence-confirmed gaps are repaired, never a
+    broader "any field implies a real intent" rule (that would be a
+    genuine behavior change beyond what either confirmed case needs)."""
+    if not action.recommendation_request:
         return action
 
-    if not has_searchable_target(current_state):
-        effective_intent = Intent.SEARCH
-    else:
-        bound_already_set = (
-            (action.price_min is not None and current_state.price_min is not None)
-            or (action.price_max is not None and current_state.price_max is not None)
-        )
-        # MODIFY_FILTER when ANY corresponding bound already exists (this also
-        # correctly engages StateManager.apply()'s stale-opposite-bound-clearing
-        # safety net, which is scoped to modify_filter only); plain ADD_FILTER only
-        # when neither newly-stated bound was already present.
-        effective_intent = Intent.MODIFY_FILTER if bound_already_set else Intent.ADD_FILTER
+    if action.intent == Intent.NO_OP:
+        if action.price_min is None and action.price_max is None:
+            return action
+        if not has_searchable_target(current_state):
+            effective_intent = Intent.SEARCH
+        else:
+            bound_already_set = (
+                (action.price_min is not None and current_state.price_min is not None)
+                or (action.price_max is not None and current_state.price_max is not None)
+            )
+            # MODIFY_FILTER when ANY corresponding bound already exists (this also
+            # correctly engages StateManager.apply()'s stale-opposite-bound-clearing
+            # safety net, which is scoped to modify_filter only); plain ADD_FILTER only
+            # when neither newly-stated bound was already present.
+            effective_intent = Intent.MODIFY_FILTER if bound_already_set else Intent.ADD_FILTER
+        return action.model_copy(update={"intent": effective_intent})
 
-    return action.model_copy(update={"intent": effective_intent})
+    if action.intent in (Intent.SEARCH, Intent.ADD_FILTER, Intent.MODIFY_FILTER):
+        states_new_value = any([
+            action.raw_query_text, action.category_hint, action.brand_text, action.free_from,
+            action.price_min is not None, action.price_max is not None,
+        ])
+        if states_new_value:
+            return action
+        return action.model_copy(update={"intent": Intent.NO_OP})
+
+    return action
 
 
 @dataclass

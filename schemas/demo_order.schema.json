@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://project6.local/schemas/demo_order.schema.json",
+  "title": "DemoOrder",
+  "description": "A single Project 6 in-chat DEMO checkout order. Saving this JSON file means checkout submission succeeded inside Project 6 only -- it does NOT mean a real Spinneys order was received, paid, or dispatched.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "order_id",
+    "session_id",
+    "products",
+    "total_price",
+    "customer",
+    "payment_method",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "minLength": 1
+    },
+    "order_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "products": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name_en", "name_ar", "quantity", "unit_price", "line_total"],
+        "properties": {
+          "id": { "type": "integer" },
+          "name_en": { "type": "string", "minLength": 1 },
+          "name_ar": { "type": "string", "minLength": 1 },
+          "quantity": { "type": "integer", "minimum": 1 },
+          "unit_price": { "type": "number", "exclusiveMinimum": 0 },
+          "line_total": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      }
+    },
+    "total_price": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "customer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "phone", "delivery_address"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "phone": { "type": "string", "minLength": 1 },
+        "delivery_address": { "type": "string", "minLength": 1 }
+      }
+    },
+    "payment_method": {
+      "const": "cash_on_delivery"
+    },
+    "status": {
+      "const": "submitted"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

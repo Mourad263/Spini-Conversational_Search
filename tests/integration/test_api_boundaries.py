@@ -51,8 +51,14 @@ def test_sql_injection_shaped_input_is_safe():
 
 
 def test_negative_price_min_is_a_noop_not_an_error():
+    # Sprint 6 effective-price consistency task: ANY bounded price query
+    # now also requires a valid positive effective price (query.py's
+    # hard_filter), excluding the 78 real rows where both price and
+    # special_price are 0 (an ingestion gap, not a genuine free price) --
+    # those are "unknown," not "matches every bound including negative
+    # ones." 25881 - 78 = 25803 is every OTHER real product.
     result = adapter.search(FilterSet(price_min=-50), limit=1)
-    assert result.total_count == 25881  # every real product has price >= 0
+    assert result.total_count == 25803
 
 
 def test_genuinely_inverted_range_is_rejected_not_silently_empty():

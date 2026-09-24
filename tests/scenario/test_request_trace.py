@@ -113,7 +113,35 @@ def test_recommendation_trace_reflects_actual_invocation(caplog):
     trace = _last_trace(caplog)
     assert trace["route"] == "recommendation"
     assert trace["recommendation_calls"] == 1
-    assert trace["search_calls"] >= 1  # the recommendation-evidence + band searches
+    # Pure continuation (no price band to explore) reuses last_shown_products
+    # from turn 1's own search instead of re-searching -- zero new calls.
+    assert trace["search_calls"] == 0
+
+
+# --- C2: the exact reported browser sequence (real typo repair collapses
+# to the same repaired query on both turns; a NO_OP continuation follows) ---
+
+def test_pepsi_typo_then_pure_continuation_makes_no_redundant_search(caplog):
+    sm, store = StateManager(), SessionActivityStore()
+    understand_fn = stub_understand(
+        Action(intent=Intent.SEARCH, raw_query_text="pepsi", brand_text="pepsi"),
+        Action(intent=Intent.SEARCH, raw_query_text="pepsi", brand_text="pepsi"),
+        Action(intent=Intent.NO_OP, recommendation_request=True),
+    )
+    search = RecordingSearch()
+    handle_message("s1", "pepsi", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=search)
+    handle_message("s1", "pebsi", state_manager=sm, activity_store=store,
+                    understand_fn=understand_fn, search_fn=search)
+
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        handle_message("s1", "suggest to me more", state_manager=sm, activity_store=store,
+                        understand_fn=understand_fn, search_fn=search)
+
+    trace = _last_trace(caplog)
+    assert trace["route"] == "recommendation"
+    assert trace["recommendation_calls"] == 1
+    assert trace["search_calls"] == 0
 
 
 def test_no_recommendation_means_zero_recommendation_calls(caplog):

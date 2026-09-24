@@ -36,8 +36,9 @@ class RecordingSearch:
 # --- unit-level: build_assistant_message() directly, no DB/network needed ---
 
 def test_build_assistant_message_greeting_helper():
-    assert messages.greeting(False) == "Hello! How can I help you?"
-    assert messages.greeting(True) == "أهلاً! أقدر أساعدك إزاي؟"
+    # Sprint 6 social fast-path task: greeting now names the assistant, Spini.
+    assert messages.greeting(False) == "Hello! I'm Spini. How can I help you?"
+    assert messages.greeting(True) == "مرحباً! أنا Spini، كيف يمكنني مساعدتك؟"
 
 
 def test_precedence_blocked_wins_over_everything():
@@ -111,11 +112,15 @@ def test_code_switch_with_arabic_script_selects_arabic():
 # --- end-to-end via handle_message() -- real validate()/StateManager/SearchAdapter ---
 
 def test_english_search_success_end_to_end():
+    # Sprint 6 recommendation-offer task: a successful normal search with
+    # no recommendation_request of its own now appends a proactive offer.
     sm, store = StateManager(), SessionActivityStore()
     understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="milk", category_hint="milk"))
     r = handle_message("t1", "I need milk", state_manager=sm, activity_store=store,
                         understand_fn=understand_fn, search_fn=RecordingSearch())
-    assert r.assistant_message == "Sure, I found these products for you."
+    assert r.assistant_message == (
+        "Sure, I found these products for you. Would you like me to recommend some alternatives?"
+    )
 
 
 def test_arabic_search_success_end_to_end():
@@ -123,7 +128,7 @@ def test_arabic_search_success_end_to_end():
     understand_fn = stub_understand(Action(intent=Intent.SEARCH, raw_query_text="جبنة", category_hint="جبنة"))
     r = handle_message("t2", "عايز جبنة", state_manager=sm, activity_store=store,
                         understand_fn=understand_fn, search_fn=RecordingSearch())
-    assert r.assistant_message == "أكيد، لقيت لك المنتجات دي."
+    assert r.assistant_message == "أكيد، لقيت لك المنتجات دي. هل تريد أن أرشح لك بعض البدائل؟"
 
 
 def test_search_plus_recommendations_end_to_end():
@@ -227,7 +232,9 @@ def test_add_filter_end_to_end():
                     understand_fn=understand_fn, search_fn=RecordingSearch())
     r2 = handle_message("t11", "also Juhayna", state_manager=sm, activity_store=store,
                          understand_fn=understand_fn, search_fn=RecordingSearch())
-    assert r2.assistant_message == "Sure, I've updated your search with that filter."
+    assert r2.assistant_message == (
+        "Sure, I've updated your search with that filter. Would you like me to recommend some alternatives?"
+    )
 
 
 def test_modify_filter_end_to_end():
@@ -240,7 +247,7 @@ def test_modify_filter_end_to_end():
                     understand_fn=understand_fn, search_fn=RecordingSearch())
     r2 = handle_message("t12", "cheese instead", state_manager=sm, activity_store=store,
                          understand_fn=understand_fn, search_fn=RecordingSearch())
-    assert r2.assistant_message == "Sure, I've updated your search."
+    assert r2.assistant_message == "Sure, I've updated your search. Would you like me to recommend some alternatives?"
 
 
 def test_remove_filter_end_to_end():
@@ -253,7 +260,7 @@ def test_remove_filter_end_to_end():
                     understand_fn=understand_fn, search_fn=RecordingSearch())
     r2 = handle_message("t13", "never mind the brand", state_manager=sm, activity_store=store,
                          understand_fn=understand_fn, search_fn=RecordingSearch())
-    assert r2.assistant_message == "Sure, I've removed that filter."
+    assert r2.assistant_message == "Sure, I've removed that filter. Would you like me to recommend some alternatives?"
 
 
 def test_blocked_request_end_to_end():

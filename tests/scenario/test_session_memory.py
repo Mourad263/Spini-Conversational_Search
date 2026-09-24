@@ -252,5 +252,8 @@ def test_recall_interleaved_with_recommendation_flow_still_works():
 
     r_rec = handle_message("s1", "what do you recommend?", state_manager=sm, activity_store=store,
                             understand_fn=understand_fn, search_fn=search)
-    assert len(search.calls) > calls_after_recall  # recommendation path still searches
+    # Pure continuation, nothing new explored -- recommendation evidence
+    # reuses last_shown_products from the "milk" search instead of
+    # re-searching, so no new SearchAdapter call happens here.
+    assert len(search.calls) == calls_after_recall
     assert r_rec.assistant_message

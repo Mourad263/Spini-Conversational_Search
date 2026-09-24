@@ -73,15 +73,32 @@ class SearchIndex:
 
         total_len = 0
         for pid, name_en, name_ar, url_key, sku in rows:
-            tokens = tokenize(name_en, base_freq) + tokenize(name_ar, base_freq)
-            tf = Counter(tokens)
+            # Sprint 6 product-identity relevance task: some catalog rows
+            # have name_ar that is just name_en's own Latin text again
+            # (untranslated data), not a real second-language mention -- a
+            # plain concatenation then double-counted every shared token,
+            # inflating BM25 term frequency for those rows alone (real
+            # measured symptom: "Vidal Candy Belts With Watermelon" scored
+            # tf=2 for "watermelon" purely from this duplication, ranking
+            # above genuine watermelon-fruit rows with tf=1). Taking the
+            # per-token MAX across the two fields instead of summing them
+            # treats "the same word in both fields" as the one mention it
+            # actually is; a token distinct to either field (the normal
+            # case -- Arabic script tokens never collide with English
+            # ones) is completely unaffected, since max(n, 0) == n.
+            tf_en = Counter(tokenize(name_en, base_freq))
+            tf_ar = Counter(tokenize(name_ar, base_freq))
+            tf = Counter({
+                token: max(tf_en.get(token, 0), tf_ar.get(token, 0))
+                for token in tf_en.keys() | tf_ar.keys()
+            })
             idx.doc_term_freq[pid] = tf
-            idx.doc_len[pid] = len(tokens)
+            idx.doc_len[pid] = sum(tf.values())
             idx.doc_sku[pid] = sku or ""
             idx.doc_url_key_tokens[pid] = set(tokenize((url_key or "").replace("-", " "), base_freq))
             for token in tf:
                 idx.postings[token].add(pid)
-            total_len += len(tokens)
+            total_len += idx.doc_len[pid]
 
         idx.base_freq = base_freq
         idx.n_docs = len(idx.doc_len)
